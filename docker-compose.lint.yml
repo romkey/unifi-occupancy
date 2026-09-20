@@ -1,0 +1,14 @@
+# Lint and type checks, the same three commands CI runs.
+#
+#   docker compose -f docker-compose.lint.yml run --rm lint
+
+services:
+  lint:
+    build:
+      context: .
+      target: dev
+    volumes:
+      - ./src:/app/src:ro
+      - ./tests:/app/tests:ro
+    command: >
+      sh -c "ruff check . && black --check . && mypy"

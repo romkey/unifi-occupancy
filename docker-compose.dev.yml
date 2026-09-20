@@ -1,0 +1,30 @@
+# Development: live-reloaded source plus a throwaway MQTT broker.
+#
+#   docker compose -f docker-compose.dev.yml up
+#
+# The broker listens on localhost:1883 so you can watch traffic with
+#   mosquitto_sub -h localhost -t 'unifi-occupancy/#' -v
+
+services:
+  unifi-occupancy:
+    build:
+      context: .
+      target: dev
+    env_file: .env
+    environment:
+      MQTT_HOST: mosquitto
+      LOG_LEVEL: DEBUG
+    volumes:
+      - ./src:/app/src:ro
+      - ./tests:/app/tests:ro
+    depends_on:
+      - mosquitto
+    restart: unless-stopped
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    command: >
+      sh -c "printf 'listener 1883\nallow_anonymous true\n' > /mosquitto/config/mosquitto.conf
+      && exec mosquitto -c /mosquitto/config/mosquitto.conf"
+    ports:
+      - "1883:1883"

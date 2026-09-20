@@ -1,0 +1,14 @@
+# Tests: no broker and no controller needed, everything is faked.
+#
+#   docker compose -f docker-compose.test.yml run --rm test
+
+services:
+  test:
+    build:
+      context: .
+      target: dev
+    volumes:
+      - ./src:/app/src:ro
+      - ./tests:/app/tests:ro
+    command: >
+      python -m pytest --cov --cov-report=term-missing
