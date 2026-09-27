@@ -1,12 +1,12 @@
 # unifi-occupancy
 
-[![CI](https://img.shields.io/github/actions/workflow/status/romkey/unifi-occupancy/ci.yml?branch=main&label=CI&logo=githubactions&logoColor=white)](https://github.com/romkey/unifi-occupancy/actions/workflows/ci.yml)
-[![Lint](https://img.shields.io/badge/lint-ruff%20%7C%20black%20%7C%20mypy-261230?logo=ruff&logoColor=white)](https://github.com/romkey/unifi-occupancy/actions/workflows/ci.yml)
+[![Lint](https://img.shields.io/github/actions/workflow/status/romkey/unifi-occupancy/lint.yml?branch=main&label=lint&logo=githubactions&logoColor=white)](https://github.com/romkey/unifi-occupancy/actions/workflows/lint.yml)
+[![Tests](https://img.shields.io/github/actions/workflow/status/romkey/unifi-occupancy/test.yml?branch=main&label=tests&logo=githubactions&logoColor=white)](https://github.com/romkey/unifi-occupancy/actions/workflows/test.yml)
 [![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![UniFi Protect](https://img.shields.io/badge/UniFi-Protect-0559C9?logo=ubiquiti&logoColor=white)](https://www.ui.com/camera-security)
 [![MQTT](https://img.shields.io/badge/MQTT-3.1.1%20%7C%205.0-660066?logo=mqtt&logoColor=white)](https://mqtt.org/)
 [![Home Assistant](https://img.shields.io/badge/Home%20Assistant-autodiscovery-41BDF5?logo=homeassistant&logoColor=white)](https://www.home-assistant.io/integrations/mqtt/)
-[![Docker](https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white)](./Dockerfile)
+[![Docker image](https://img.shields.io/github/actions/workflow/status/romkey/unifi-occupancy/docker-publish.yml?label=docker%20image&logo=githubactions&logoColor=white)](https://github.com/romkey/unifi-occupancy/actions/workflows/docker-publish.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-0A7E8C.svg)](./LICENSE)
 
 Publish UniFi Protect detection state to MQTT — **without giving anything access to camera
