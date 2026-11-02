@@ -17,6 +17,9 @@ services:
     volumes:
       - ./src:/app/src:ro
       - ./tests:/app/tests:ro
+      - ./config:/config:ro
+      - ./.dev/www:/var/www/html
+      - ./.dev/data:/var/lib/unifi-occupancy
     depends_on:
       - mosquitto
     restart: unless-stopped
