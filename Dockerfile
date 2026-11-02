@@ -33,9 +33,16 @@ FROM base AS runtime
 
 RUN pip install . \
     && rm -rf /root/.cache \
-    && useradd --system --create-home --uid 10001 occupancy
+    && useradd --system --create-home --uid 10001 occupancy \
+    && mkdir -p /config /var/www/html /var/lib/unifi-occupancy \
+    && chown occupancy:occupancy /var/www/html /var/lib/unifi-occupancy
 
 USER occupancy
+
+# The sheets and their history are the only things written outside /tmp. These
+# exist and are owned by the runtime user so that a fresh named volume inherits
+# that ownership; a *bind* mount keeps the host's, so chown those to uid 10001.
+VOLUME ["/var/www/html", "/var/lib/unifi-occupancy"]
 
 # The service holds no listening socket; liveness is "the process is alive and
 # the event loop is not wedged".

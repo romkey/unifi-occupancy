@@ -2,6 +2,11 @@
 #
 #   cp .env.example .env && $EDITOR .env
 #   docker compose up -d
+#
+# The daily occupancy sheets are opt-in: they start being written as soon as
+# ./config/config.yaml exists.
+#
+#   mkdir -p config && cp config.example.yaml config/config.yaml
 
 services:
   unifi-occupancy:
@@ -19,8 +24,20 @@ services:
       - ALL
     tmpfs:
       - /tmp
+    volumes:
+      # Groups and periods. Nothing is written here; no file, no sheets.
+      - ./config:/config:ro
+      # The generated sheets. Point a web server at this, or bind-mount the
+      # document root of one you already run.
+      - occupancy-www:/var/www/html
+      # The detection history the sheets are rendered from.
+      - occupancy-data:/var/lib/unifi-occupancy
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
+
+volumes:
+  occupancy-www:
+  occupancy-data:

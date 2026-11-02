@@ -1,14 +1,27 @@
-"""Environment-driven configuration.
+"""Configuration.
 
-Every knob the application has is read from the process environment so the
-container can be configured entirely through ``docker compose``/``--env-file``.
+The MQTT bridge is configured entirely from the process environment, so the
+container can be set up through ``docker compose``/``--env-file`` alone.
+
+The daily occupancy sheets need structure the environment is a poor fit for --
+camera groups, named times of day -- so those come from a YAML file, by default
+``/config/config.yaml``. The absence of that file is itself meaningful: it means
+no sheets.
 """
 
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import tzinfo
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+
+import yaml
+
+from .models import slugify
 
 DEFAULT_MQTT_PORT = 1883
 DEFAULT_MQTT_TLS_PORT = 8883
@@ -121,6 +134,274 @@ class DiscoveryConfig:
     node_id: str = "unifi_occupancy"
 
 
+MINUTES_PER_DAY = 24 * 60
+
+DEFAULT_CONFIG_FILE = Path("/config/config.yaml")
+
+
+@dataclass(frozen=True)
+class Period:
+    """A named stretch of the day -- morning, afternoon, evening, night."""
+
+    name: str
+    #: Minutes after local midnight at which the period begins.
+    start_minute: int
+
+
+DEFAULT_PERIODS: tuple[Period, ...] = (
+    Period("Night", 0),
+    Period("Morning", 6 * 60),
+    Period("Afternoon", 12 * 60),
+    Period("Evening", 18 * 60),
+)
+
+
+@dataclass(frozen=True)
+class PeriodBand:
+    """One contiguous stretch of a single day covered by a period.
+
+    When the earliest period starts after midnight the small hours belong to
+    whichever period wraps around from the night before, so a single period can
+    produce two bands.
+    """
+
+    name: str
+    start_minute: int
+    end_minute: int
+
+    @property
+    def minutes(self) -> int:
+        return self.end_minute - self.start_minute
+
+
+def period_bands(periods: Sequence[Period]) -> tuple[PeriodBand, ...]:
+    """Expand period start times into the bands that tile one day."""
+    if not periods:
+        return ()
+    ordered = sorted(periods, key=lambda period: period.start_minute)
+    bands: list[PeriodBand] = []
+    if ordered[0].start_minute > 0:
+        bands.append(PeriodBand(ordered[-1].name, 0, ordered[0].start_minute))
+    for index, period in enumerate(ordered):
+        end = ordered[index + 1].start_minute if index + 1 < len(ordered) else MINUTES_PER_DAY
+        if end > period.start_minute:
+            bands.append(PeriodBand(period.name, period.start_minute, end))
+    return tuple(bands)
+
+
+@dataclass(frozen=True)
+class CameraGroup:
+    """Cameras covering one area, reported together."""
+
+    name: str
+    #: Camera names, slugs or Protect ids; matched case- and punctuation-insensitively.
+    members: tuple[str, ...]
+
+    @property
+    def key(self) -> str:
+        return slugify(self.name)
+
+
+@dataclass(frozen=True)
+class ReportConfig:
+    """The daily occupancy sheets: what to write, where, and how to shade it."""
+
+    enabled: bool = True
+    output_dir: Path = Path("/var/www/html")
+    database: Path = Path("/var/lib/unifi-occupancy/occupancy.sqlite3")
+    title: str = "Occupancy"
+    #: IANA zone name. Days, midnights and periods are all local to it.
+    timezone: str = "UTC"
+    #: Width of one bucket on the density strips.
+    bucket_minutes: int = 10
+    #: How often the current day's sheet is rewritten.
+    refresh_minutes: int = 60
+    #: Days of history to keep; 0 keeps everything.
+    retention_days: int = 0
+    periods: tuple[Period, ...] = DEFAULT_PERIODS
+    groups: tuple[CameraGroup, ...] = ()
+
+    @property
+    def tz(self) -> tzinfo:
+        return ZoneInfo(self.timezone)
+
+    @property
+    def bands(self) -> tuple[PeriodBand, ...]:
+        return period_bands(self.periods)
+
+
+def _yaml_mapping(value: object, where: str) -> Mapping[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ConfigError(f"{where} must be a mapping")
+    return {str(key): item for key, item in value.items()}
+
+
+def _yaml_str(raw: Mapping[str, Any], key: str, default: str, where: str) -> str:
+    value = raw.get(key, default)
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"{where}.{key} must be a non-empty string")
+    return value.strip()
+
+
+def _yaml_bool(raw: Mapping[str, Any], key: str, default: bool, where: str) -> bool:
+    value = raw.get(key, default)
+    if not isinstance(value, bool):
+        raise ConfigError(f"{where}.{key} must be true or false")
+    return value
+
+
+def _yaml_int(
+    raw: Mapping[str, Any], key: str, default: int, where: str, *, minimum: int, maximum: int
+) -> int:
+    value = raw.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(f"{where}.{key} must be a whole number")
+    if not minimum <= value <= maximum:
+        raise ConfigError(f"{where}.{key} must be between {minimum} and {maximum}, got {value}")
+    return value
+
+
+def _yaml_path(raw: Mapping[str, Any], key: str, default: Path, where: str) -> Path:
+    value = raw.get(key)
+    if value is None:
+        return default
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"{where}.{key} must be a path")
+    return Path(value.strip())
+
+
+def _time_of_day(value: object, where: str) -> int:
+    """Minutes after midnight from ``"06:00"``.
+
+    PyYAML reads an unquoted ``18:00`` as the integer 1080 -- which is already
+    minutes after midnight -- so quoted and unquoted times both land here
+    correctly. A bare number is therefore minutes, not hours.
+    """
+    if isinstance(value, bool):
+        raise ConfigError(f'{where} must be a time of day like "06:00"')
+    if isinstance(value, int):
+        minutes = value
+    elif isinstance(value, str):
+        parts = value.strip().split(":")
+        if len(parts) != 2 or not all(part.isdigit() for part in parts):
+            raise ConfigError(f'{where} must be a time of day like "06:00", got {value!r}')
+        if int(parts[1]) > 59:
+            raise ConfigError(f"{where} has more than 59 minutes: {value!r}")
+        minutes = int(parts[0]) * 60 + int(parts[1])
+    else:
+        raise ConfigError(f'{where} must be a time of day like "06:00"')
+    if not 0 <= minutes < MINUTES_PER_DAY:
+        raise ConfigError(f"{where} must fall between 00:00 and 23:59, got {value!r}")
+    return minutes
+
+
+def _parse_periods(raw: object) -> tuple[Period, ...]:
+    if raw is None:
+        return DEFAULT_PERIODS
+    if not isinstance(raw, list) or not raw:
+        raise ConfigError("periods must be a non-empty list")
+    periods: list[Period] = []
+    for index, item in enumerate(raw):
+        where = f"periods[{index}]"
+        entry = _yaml_mapping(item, where)
+        if "start" not in entry:
+            raise ConfigError(f"{where} needs a start time")
+        periods.append(
+            Period(
+                name=_yaml_str(entry, "name", "", where),
+                start_minute=_time_of_day(entry["start"], f"{where}.start"),
+            )
+        )
+    return tuple(periods)
+
+
+def _parse_groups(raw: object) -> tuple[CameraGroup, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ConfigError("groups must be a list")
+    groups: list[CameraGroup] = []
+    for index, item in enumerate(raw):
+        where = f"groups[{index}]"
+        entry = _yaml_mapping(item, where)
+        members = entry.get("cameras")
+        if isinstance(members, str):
+            members = [members]
+        if not isinstance(members, list) or not members:
+            raise ConfigError(f"{where}.cameras must be a non-empty list of camera names")
+        groups.append(
+            CameraGroup(
+                name=_yaml_str(entry, "name", "", where),
+                members=tuple(str(member).strip() for member in members if str(member).strip()),
+            )
+        )
+    keys = [group.key for group in groups]
+    duplicate = next((key for key in keys if keys.count(key) > 1), None)
+    if duplicate is not None:
+        raise ConfigError(f"two groups resolve to the same name: {duplicate!r}")
+    return tuple(groups)
+
+
+def parse_report_config(text: str, *, default_timezone: str = "UTC") -> ReportConfig:
+    """Parse the contents of ``config.yaml``."""
+    try:
+        document = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"config.yaml is not valid YAML: {exc}") from exc
+
+    root = _yaml_mapping(document, "config.yaml")
+    reports = _yaml_mapping(root.get("reports"), "reports")
+
+    timezone = _yaml_str(root, "timezone", default_timezone, "config.yaml")
+    try:
+        ZoneInfo(timezone)
+    except (KeyError, ValueError, OSError) as exc:
+        raise ConfigError(f"timezone {timezone!r} is not a known IANA zone name") from exc
+
+    return ReportConfig(
+        enabled=_yaml_bool(reports, "enabled", True, "reports"),
+        output_dir=_yaml_path(reports, "output_dir", Path("/var/www/html"), "reports"),
+        database=_yaml_path(
+            reports,
+            "database",
+            Path("/var/lib/unifi-occupancy/occupancy.sqlite3"),
+            "reports",
+        ),
+        title=_yaml_str(reports, "title", "Occupancy", "reports"),
+        timezone=timezone,
+        bucket_minutes=_yaml_int(
+            reports, "bucket_minutes", 10, "reports", minimum=1, maximum=MINUTES_PER_DAY
+        ),
+        refresh_minutes=_yaml_int(
+            reports, "refresh_minutes", 60, "reports", minimum=1, maximum=MINUTES_PER_DAY
+        ),
+        retention_days=_yaml_int(
+            reports, "retention_days", 0, "reports", minimum=0, maximum=36_500
+        ),
+        periods=_parse_periods(root.get("periods")),
+        groups=_parse_groups(root.get("groups")),
+    )
+
+
+def load_report_config(path: Path, env: Mapping[str, str] | None = None) -> ReportConfig | None:
+    """Read ``config.yaml``, or ``None`` when there is no such file.
+
+    No file means no sheets. That is how this stays switched off for anyone who
+    upgrades without asking for it, and why the daily sheets are opt-in by
+    creating the file rather than by setting yet another variable.
+    """
+    env = os.environ if env is None else env
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ConfigError(f"could not read {path}: {exc}") from exc
+    return parse_report_config(text, default_timezone=_get(env, "TZ") or "UTC")
+
+
 @dataclass(frozen=True)
 class Config:
     protect: ProtectConfig
@@ -129,6 +410,10 @@ class Config:
     log_level: str = "INFO"
     #: How long a smart detection stays "on" after the last event that reported it.
     detection_hold_seconds: float = 30.0
+    #: Where to look for the YAML file describing groups, periods and sheets.
+    config_file: Path = DEFAULT_CONFIG_FILE
+    #: Filled in from :func:`load_report_config`; ``None`` disables the sheets.
+    reports: ReportConfig | None = None
 
 
 def load_config(env: Mapping[str, str] | None = None) -> Config:
@@ -175,4 +460,5 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         discovery=discovery,
         log_level=(_get(env, "LOG_LEVEL", "INFO") or "INFO").upper(),
         detection_hold_seconds=_get_positive_float(env, "DETECTION_HOLD_SECONDS", 30.0),
+        config_file=Path(_get(env, "CONFIG_FILE") or DEFAULT_CONFIG_FILE),
     )
