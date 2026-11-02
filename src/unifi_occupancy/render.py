@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from html import escape
 
-from .config import PeriodBand, ReportConfig
+from .config import ReportConfig
 from .models import MOTION, PERSON, kind_for
 
 #: Detection kinds that always get a track, even on a day with nothing in them.
@@ -24,6 +24,29 @@ ALWAYS_RENDERED: tuple[str, ...] = (MOTION, PERSON)
 
 #: Enough shades to tile the day; period bands cycle through them in time order.
 BAND_CLASSES = 6
+
+
+@dataclass(frozen=True)
+class BandSpan:
+    """One period, as a fraction of the day it is drawn on.
+
+    Measured by the caller rather than worked out from the clock here, because
+    a day is not always 1440 minutes long and the shading has to line up with
+    the detections drawn over it.
+    """
+
+    name: str
+    start: float
+    end: float
+    shade: int
+
+
+@dataclass(frozen=True)
+class AxisMark:
+    """An hour label, at the fraction of the day where that hour really fell."""
+
+    label: str
+    at: float
 
 
 @dataclass(frozen=True)
@@ -85,6 +108,8 @@ class DaySheet:
     peak_bucket: int = 0
     previous_day: date | None = None
     next_day: date | None = None
+    bands: tuple[BandSpan, ...] = ()
+    axis: tuple[AxisMark, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -253,27 +278,12 @@ def _pct(value: float) -> str:
     return f"{max(0.0, min(100.0, value * 100)):.4f}".rstrip("0").rstrip(".") or "0"
 
 
-def _band_index(bands: Sequence[PeriodBand], band: PeriodBand) -> int:
-    """Shade index for a band, stable across the bands sharing its name."""
-    names: list[str] = []
-    for candidate in bands:
-        if candidate.name not in names:
-            names.append(candidate.name)
-    return names.index(band.name) % BAND_CLASSES
-
-
-def _bands_html(bands: Sequence[PeriodBand], total_minutes: int) -> str:
-    if not bands or total_minutes <= 0:
-        return ""
-    parts: list[str] = []
-    for band in bands:
-        left = band.start_minute / total_minutes
-        width = band.minutes / total_minutes
-        parts.append(
-            f'<i class="band i{_band_index(bands, band)}" '
-            f'style="left:{_pct(left)}%;width:{_pct(width)}%"></i>'
-        )
-    return "".join(parts)
+def _bands_html(bands: Sequence[BandSpan]) -> str:
+    return "".join(
+        f'<i class="band i{band.shade % BAND_CLASSES}" '
+        f'style="left:{_pct(band.start)}%;width:{_pct(max(band.end - band.start, 0.0))}%"></i>'
+        for band in bands
+    )
 
 
 def _track_html(track: Track, bands_html: str, peak: int) -> str:
@@ -319,13 +329,14 @@ def _row_html(row: Row, bands_html: str, peak: int) -> str:
     )
 
 
-def _axis_html(hours: int = 24, step: int = 3) -> str:
-    marks = list(range(0, hours + 1, step))
-    spans = "".join(f'<span style="left:{_pct(hour / hours)}%">{hour:02d}</span>' for hour in marks)
+def _axis_html(marks: Sequence[AxisMark]) -> str:
+    spans = "".join(
+        f'<span style="left:{_pct(mark.at)}%">{escape(mark.label)}</span>' for mark in marks
+    )
     return f'<div class="rowaxis"><div></div><div class="axis">{spans}</div></div>'
 
 
-def _section_html(section: Section, bands_html: str, peak: int) -> str:
+def _section_html(section: Section, bands_html: str, peak: int, axis: str) -> str:
     rows = "".join(_row_html(row, bands_html, peak) for row in section.rows)
     totals = " · ".join(
         f"{escape(kind_for(kind).name)} {count}"
@@ -336,12 +347,12 @@ def _section_html(section: Section, bands_html: str, peak: int) -> str:
         f'<section class="group" id="{escape(section.key, quote=True)}">'
         f'<div class="ghead"><h2>{escape(section.name)}</h2>'
         f'<div class="t">{totals}</div></div>'
-        f"{rows}{_axis_html()}"
+        f"{rows}{axis}"
         f"</section>"
     )
 
 
-def _legend_html(bands: Sequence[PeriodBand], peak: int) -> str:
+def _legend_html(bands: Sequence[BandSpan], peak: int) -> str:
     kinds = "".join(
         f'<span class="k {escape(kind)}"><i class="sw"></i>{escape(kind_for(kind).name)}</span>'
         for kind in ALWAYS_RENDERED
@@ -353,7 +364,7 @@ def _legend_html(bands: Sequence[PeriodBand], peak: int) -> str:
             continue
         seen.append(band.name)
         periods.append(
-            f'<span class="per"><i class="sw i{_band_index(bands, band)}"></i>'
+            f'<span class="per"><i class="sw i{band.shade % BAND_CLASSES}"></i>'
             f"{escape(band.name)}</span>"
         )
     density = (
@@ -384,8 +395,8 @@ def day_filename(day: date) -> str:
 
 def render_day(sheet: DaySheet, reports: ReportConfig) -> str:
     """Render one day's sheet."""
-    bands = reports.bands
-    bands_html = _bands_html(bands, 24 * 60)
+    bands_html = _bands_html(sheet.bands)
+    axis_html = _axis_html(sheet.axis)
     heading = sheet.day.strftime("%A %-d %B %Y") if _supports_dash() else sheet.day.isoformat()
     title = f"{reports.title} — {sheet.day.isoformat()}"
 
@@ -412,7 +423,8 @@ def render_day(sheet: DaySheet, reports: ReportConfig) -> str:
         for section in sheet.sections
     )
     sections = "".join(
-        _section_html(section, bands_html, sheet.peak_bucket) for section in sheet.sections
+        _section_html(section, bands_html, sheet.peak_bucket, axis_html)
+        for section in sheet.sections
     )
     if not sections:
         sections = '<p class="empty">No cameras to report on yet.</p>'
@@ -425,7 +437,7 @@ def render_day(sheet: DaySheet, reports: ReportConfig) -> str:
         f'{"".join(nav)}\n'
         f'<div class="cards">{cards}</div>\n'
         f"{sections}\n"
-        f"{_legend_html(bands, sheet.peak_bucket)}"
+        f"{_legend_html(sheet.bands, sheet.peak_bucket)}"
     )
     return _page(title, body)
 

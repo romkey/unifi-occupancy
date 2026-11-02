@@ -23,6 +23,9 @@ from .config import MINUTES_PER_DAY, ReportConfig
 from .models import DETECTION_KEYS, Camera, slugify
 from .render import (
     ALWAYS_RENDERED,
+    BAND_CLASSES,
+    AxisMark,
+    BandSpan,
     DaySheet,
     IndexCell,
     IndexEntry,
@@ -57,21 +60,29 @@ def day_window(day: date, zone: tzinfo) -> tuple[datetime, datetime]:
 
 
 def next_refresh(now: datetime, reports: ReportConfig) -> datetime:
-    """The next wall-clock boundary at which the sheets should be rewritten.
+    """The next boundary at which the sheets should be rewritten.
 
-    Aligned to local time so that an hourly refresh lands on the hour, and so
-    that the day's final refresh lands on local midnight.
+    Slots are **wall clock**: an hourly refresh lands on the hour as the clock
+    in the hallway reads it, and the day's last refresh lands on local
+    midnight. A clock-change day therefore has 23 or 25 of them, which is the
+    point -- the sheet is rewritten when a reader would expect it to be, not 24
+    times at even real-time intervals.
+
+    Written out of ``local.hour``/``local.minute`` rather than out of the time
+    elapsed since midnight. The two happen to agree, because subtracting two
+    aware datetimes that share one ``tzinfo`` ignores the offset, but relying
+    on that is a trap for whoever edits this next.
     """
     zone = reports.tz
     step = reports.refresh_minutes
     local = now.astimezone(zone)
-    midnight = datetime.combine(local.date(), time.min, tzinfo=zone)
-    elapsed = (local - midnight).total_seconds() / 60.0
-    slot = int(elapsed // step) + 1
+    slot = (local.hour * 60 + local.minute) // step + 1
     if slot * step >= MINUTES_PER_DAY:
         candidate = datetime.combine(local.date() + timedelta(days=1), time.min, tzinfo=zone)
     else:
-        candidate = midnight + timedelta(minutes=slot * step)
+        hour, minute = divmod(slot * step, 60)
+        candidate = datetime.combine(local.date(), time(hour, minute), tzinfo=zone)
+    # An ambiguous or skipped local time can land on or behind us; never stall.
     while candidate <= now:
         candidate += timedelta(minutes=step)
     return candidate
@@ -209,6 +220,41 @@ class SheetWriter:
             seconds=sum(end - start for start, end in spans),
         )
 
+    def _at(self, day: date, minute: int, window: _Window) -> float:
+        """Where a wall-clock minute of ``day`` falls as a fraction of it."""
+        if minute >= MINUTES_PER_DAY:
+            return 1.0
+        hour, rest = divmod(minute, 60)
+        return window.fraction(datetime.combine(day, time(hour, rest), tzinfo=self._reports.tz))
+
+    def _bands(self, window: _Window) -> tuple[BandSpan, ...]:
+        """Period shading, placed against the day's real length.
+
+        A clock-change day is 23 or 25 hours long, so noon is not halfway
+        through it. Measuring each boundary the same way the detections are
+        measured is what keeps the shading under the bars it belongs to.
+        """
+        shades: dict[str, int] = {}
+        spans: list[BandSpan] = []
+        for band in self._reports.bands:
+            shade = shades.setdefault(band.name, len(shades) % BAND_CLASSES)
+            spans.append(
+                BandSpan(
+                    name=band.name,
+                    start=self._at(window.day, band.start_minute, window),
+                    end=self._at(window.day, band.end_minute, window),
+                    shade=shade,
+                )
+            )
+        return tuple(spans)
+
+    def _axis(self, window: _Window, step_hours: int = 3) -> tuple[AxisMark, ...]:
+        """Hour labels, at the fraction of the day each hour really fell on."""
+        return tuple(
+            AxisMark(label=f"{hour:02d}", at=self._at(window.day, hour * 60, window))
+            for hour in range(0, 25, step_hours)
+        )
+
     def _segment_title(self, start: float, end: float, window: _Window) -> str:
         """Hover text for one segment; ``start`` and ``end`` are seconds into the day."""
         zone = self._reports.tz
@@ -216,7 +262,7 @@ class SheetWriter:
         ended = (window.start + timedelta(seconds=end)).astimezone(zone)
         return f"{began:%H:%M:%S} \u2013 {ended:%H:%M:%S} ({round(end - start)}s)"
 
-    def _build(self, day: date) -> tuple[tuple[Section, ...], int, list[Summary]]:
+    def _build(self, day: date) -> tuple[_Window, tuple[Section, ...], int, list[Summary]]:
         window_start, window_end = day_window(day, self._reports.tz)
         window = _Window(
             day=day,
@@ -289,7 +335,7 @@ class SheetWriter:
                 for kind in kinds
             )
 
-        return tuple(sections), peak, summaries
+        return window, tuple(sections), peak, summaries
 
     # -- writing ----------------------------------------------------------
 
@@ -303,19 +349,54 @@ class SheetWriter:
         scratch.replace(target)
         return target
 
-    def write_day(self, day: date, *, save: bool = True) -> Path:
-        sections, peak, summaries = self._build(day)
+    def _pruned(self, day: date) -> bool:
+        """True when a day's events are gone but its counts were kept.
+
+        Rendering such a day again would replace real counts with zeros and
+        overwrite a good page with an empty one -- exactly what
+        ``retention_days`` promises not to do.
+
+        A day that was simply quiet looks the same from the event log, so the
+        stored counts are what tell them apart: only a day with something to
+        lose is left alone.
+        """
+        start, end = day_window(day, self._reports.tz)
+        if self._store.events_between(start, end):
+            return False
+        stored = self._store.summaries([day.isoformat()]).get(day.isoformat(), [])
+        return any(row.events or row.seconds for row in stored)
+
+    def _sheets(self, also: Iterable[date] = ()) -> set[str]:
+        """The days that have a page, so neighbour links never point at a 404.
+
+        ``also`` names the days this pass is about to write, which do not have
+        a stored summary yet. Nothing else may be assumed into this set -- a
+        day that is merely *probably* there is how a link comes to point at a
+        page nobody wrote.
+        """
+        return set(self._store.summarised_days()) | {day.isoformat() for day in also}
+
+    def write_day(self, day: date, sheets: set[str] | None = None) -> Path | None:
+        """Render one day. ``None`` when the day has been pruned and is left be."""
+        if self._pruned(day):
+            logger.debug("%s has been pruned; leaving its sheet as it is", day)
+            return None
+        known = self._sheets() if sheets is None else sheets
+        window, sections, peak, summaries = self._build(day)
         today = self._clock().astimezone(self._reports.tz).date()
+        previous_day = day - timedelta(days=1)
+        next_day = day + timedelta(days=1)
         sheet = DaySheet(
             day=day,
             sections=sections,
             generated_at=self._clock().astimezone(self._reports.tz),
             peak_bucket=peak,
-            previous_day=day - timedelta(days=1),
-            next_day=day + timedelta(days=1) if day < today else None,
+            previous_day=previous_day if previous_day.isoformat() in known else None,
+            next_day=next_day if day < today and next_day.isoformat() in known else None,
+            bands=self._bands(window),
+            axis=self._axis(window),
         )
-        if save:
-            self._store.save_summaries(day.isoformat(), summaries)
+        self._store.save_summaries(day.isoformat(), summaries)
         return self._write(day_filename(day), render_day(sheet, self._reports))
 
     def write_index(self) -> Path:
@@ -363,9 +444,12 @@ class SheetWriter:
         today = moment.astimezone(self._reports.tz).date()
         yesterday = today - timedelta(days=1)
 
-        self.write_day(today)
-        if self._has_history(yesterday):
-            self.write_day(yesterday)
+        # Both days are known before either is written, so today's back-link
+        # does not have to wait for the pass that writes yesterday.
+        writing = [today] + ([yesterday] if self._has_history(yesterday) else [])
+        known = self._sheets(writing)
+        for day in writing:
+            self.write_day(day, known)
         self.write_index()
         self._prune(today)
 
@@ -386,7 +470,11 @@ class SheetWriter:
             logger.info("pruned %d event(s) older than %s", dropped, cutoff.date())
 
     def rebuild(self) -> int:
-        """Re-render every day the store knows about. Used by ``--rebuild``."""
+        """Re-render every day the store still has the events for.
+
+        Days whose events have been pruned keep the page and the counts they
+        already have; there is nothing left to render them from.
+        """
         zone = self._reports.tz
         days: set[date] = {date.fromisoformat(day) for day in self._store.summarised_days()}
         span = self._store.span()
@@ -396,10 +484,14 @@ class SheetWriter:
             while cursor <= last:
                 days.add(cursor)
                 cursor += timedelta(days=1)
-        for day in sorted(days):
-            self.write_day(day)
+        # Worked out up front: a day's neighbour links have to know about days
+        # that have not been written yet this pass -- and about no others.
+        known = self._sheets(days)
+        written = sum(1 for day in sorted(days) if self.write_day(day, known) is not None)
         self.write_index()
-        return len(days)
+        if written != len(days):
+            logger.info("left %d pruned day(s) as they were", len(days) - written)
+        return written
 
     async def run_forever(self) -> None:
         """Refresh on every boundary until cancelled.

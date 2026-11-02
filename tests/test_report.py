@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -121,15 +122,14 @@ def test_the_next_refresh_is_always_in_the_future(reports: ReportConfig) -> None
 
 
 def test_cameras_are_grouped_and_strays_stand_alone(writer: SheetWriter) -> None:
-    sections, _, _ = writer._build(DAY)
+    _, sections, _, _ = writer._build(DAY)
 
     assert [section.name for section in sections] == ["Front of house", "Side Gate"]
     assert [row.label for row in sections[0].rows] == ["All cameras", "Front Door", "Driveway"]
 
 
 def test_a_lone_camera_gets_no_redundant_label(writer: SheetWriter) -> None:
-    _, _, _ = writer._build(DAY)
-    sections, _, _ = writer._build(DAY)
+    _, sections, _, _ = writer._build(DAY)
 
     (row,) = sections[1].rows
     assert row.label == ""
@@ -145,7 +145,7 @@ def test_a_camera_can_be_named_by_slug_or_id(store: EventStore, reports: ReportC
             ).groups,
         }
     )
-    sections, _, _ = SheetWriter(
+    _, sections, _, _ = SheetWriter(
         store, by_slug, cameras=lambda: CAMERAS, clock=lambda: NOON.astimezone(UTC)
     )._build(DAY)
 
@@ -177,7 +177,7 @@ def test_a_camera_only_in_the_history_still_appears(
 ) -> None:
     """A camera removed from Protect keeps its place on the days it was there."""
     record(store, Camera(id="cam-9", name="Old Shed"), MOTION, at(9), 30)
-    sections, _, _ = SheetWriter(
+    _, sections, _, _ = SheetWriter(
         store, reports, cameras=lambda: (), clock=lambda: NOON.astimezone(UTC)
     )._build(DAY)
 
@@ -192,7 +192,7 @@ def test_events_are_counted_and_placed(writer: SheetWriter, store: EventStore) -
     record(store, CAMERAS[0], MOTION, at(2, 45), 60)
     record(store, CAMERAS[0], MOTION, at(20), 60)
 
-    sections, peak, _ = writer._build(DAY)
+    _, sections, peak, _ = writer._build(DAY)
     track = next(t for t in sections[0].rows[1].tracks if t.kind == MOTION)
 
     assert track.events == 3
@@ -208,7 +208,7 @@ def test_a_group_does_not_count_overlapping_time_twice(
     record(store, CAMERAS[0], MOTION, at(9), 60)
     record(store, CAMERAS[1], MOTION, at(9), 60)
 
-    sections, _, _ = writer._build(DAY)
+    _, sections, _, _ = writer._build(DAY)
     total = next(t for t in sections[0].rows[0].tracks if t.kind == MOTION)
 
     assert total.events == 2
@@ -222,7 +222,7 @@ def test_an_event_from_yesterday_contributes_time_but_not_a_count(
     store.start_event("cam-1", "Front Door", MOTION, at(0).astimezone(UTC) - timedelta(minutes=5))
     store.end_event("cam-1", MOTION, at(0).astimezone(UTC) + timedelta(minutes=5))
 
-    sections, _, _ = writer._build(DAY)
+    _, sections, _, _ = writer._build(DAY)
     track = next(t for t in sections[0].rows[1].tracks if t.kind == MOTION)
 
     assert track.events == 0
@@ -233,7 +233,7 @@ def test_an_event_from_yesterday_contributes_time_but_not_a_count(
 def test_a_live_event_is_drawn_only_up_to_now(writer: SheetWriter, store: EventStore) -> None:
     store.start_event("cam-1", "Front Door", MOTION, at(11, 30).astimezone(UTC))
 
-    sections, _, _ = writer._build(DAY)
+    _, sections, _, _ = writer._build(DAY)
     track = next(t for t in sections[0].rows[1].tracks if t.kind == MOTION)
 
     assert track.seconds == pytest.approx(1800.0)  # 11:30 to the 12:00 "now"
@@ -241,7 +241,7 @@ def test_a_live_event_is_drawn_only_up_to_now(writer: SheetWriter, store: EventS
 
 
 def test_motion_and_person_always_get_a_track(writer: SheetWriter) -> None:
-    sections, _, _ = writer._build(DAY)
+    _, sections, _, _ = writer._build(DAY)
 
     assert [track.kind for track in sections[0].rows[0].tracks] == [MOTION, PERSON]
 
@@ -251,7 +251,7 @@ def test_other_detections_appear_only_when_they_fire(
 ) -> None:
     record(store, CAMERAS[0], SMOKE, at(3), 120)
 
-    sections, _, _ = writer._build(DAY)
+    _, sections, _, _ = writer._build(DAY)
 
     assert [track.kind for track in sections[0].rows[0].tracks] == [MOTION, PERSON, SMOKE]
     assert [track.kind for track in sections[1].rows[0].tracks] == [MOTION, PERSON]
@@ -351,3 +351,259 @@ def test_retention_drops_old_events_but_keeps_their_counts(
     assert store.events_between(old - timedelta(days=1), old + timedelta(days=1)) == []
     assert "2026-09-20" in store.summarised_days()
     assert "2026-09-20" in (reports.output_dir / "index.html").read_text()
+
+
+# ---------------------------------------------------------------------------
+# Clock-change days, pruned days and neighbour links
+# ---------------------------------------------------------------------------
+
+FALL_BACK = date(2026, 11, 1)  # 25 hours in New York
+SPRING_FORWARD = date(2026, 3, 8)  # 23 hours
+
+
+def writer_for(store: EventStore, reports: ReportConfig, now: datetime) -> SheetWriter:
+    return SheetWriter(store, reports, cameras=lambda: CAMERAS, clock=lambda: now.astimezone(UTC))
+
+
+@pytest.mark.parametrize("day", [FALL_BACK, SPRING_FORWARD, date(2026, 6, 1)])
+def test_shading_lines_up_with_the_bars_drawn_over_it(
+    store: EventStore, reports: ReportConfig, day: date
+) -> None:
+    """A clock-change day is not 1440 minutes, so noon is not halfway through it."""
+    for minute in (0, 360, 720, 1080):
+        at = datetime.combine(day, time(minute // 60, 0), tzinfo=NY)
+        store.start_event("cam-1", "Front Door", MOTION, at.astimezone(UTC))
+        store.end_event("cam-1", MOTION, (at + timedelta(minutes=1)).astimezone(UTC))
+    end_of_day = datetime.combine(day, time(23, 59), tzinfo=NY)
+
+    window, sections, _, _ = writer_for(store, reports, end_of_day)._build(day)
+    bands = writer_for(store, reports, end_of_day)._bands(window)
+    bars = next(t for t in sections[0].rows[1].tracks if t.kind == MOTION).segments
+
+    assert len(bars) == 4
+    for band, bar in zip(bands, bars, strict=True):
+        assert band.start == pytest.approx(bar.start, abs=1e-9)
+
+
+def test_an_ordinary_day_still_shades_on_the_quarters(
+    store: EventStore, reports: ReportConfig
+) -> None:
+    window, _, _, _ = writer_for(store, reports, NOON)._build(DAY)
+
+    bands = writer_for(store, reports, NOON)._bands(window)
+
+    assert [band.start for band in bands] == [0.0, 0.25, 0.5, 0.75]
+    assert bands[-1].end == 1.0
+
+
+def test_the_hour_axis_follows_the_same_stretched_day(
+    store: EventStore, reports: ReportConfig
+) -> None:
+    end_of_day = datetime.combine(FALL_BACK, time(23, 59), tzinfo=NY)
+    window, _, _, _ = writer_for(store, reports, end_of_day)._build(FALL_BACK)
+
+    axis = writer_for(store, reports, end_of_day)._axis(window)
+
+    assert axis[0].at == 0.0
+    assert axis[-1].label == "24"
+    assert axis[-1].at == 1.0
+    # 12:00 on a 25-hour day falls 13 hours in, not 12.
+    assert next(mark.at for mark in axis if mark.label == "12") == pytest.approx(13 / 25)
+
+
+def test_periods_from_the_config_file_reach_the_bands(
+    store: EventStore, reports: ReportConfig
+) -> None:
+    owlish = ReportConfig(
+        **{
+            **reports.__dict__,
+            "periods": parse_report_config(
+                'periods:\n  - {name: Owl hours, start: "00:00"}\n'
+                '  - {name: Daylight, start: "07:00"}\n'
+            ).periods,
+        }
+    )
+    window, _, _, _ = writer_for(store, owlish, NOON)._build(DAY)
+
+    bands = writer_for(store, owlish, NOON)._bands(window)
+
+    assert [band.name for band in bands] == ["Owl hours", "Daylight"]
+    assert bands[1].start == pytest.approx(7 / 24)
+
+
+def test_bands_sharing_a_name_share_a_shade(store: EventStore, reports: ReportConfig) -> None:
+    """Night wrapping past midnight is one period drawn twice, not two periods."""
+    wrapping = ReportConfig(
+        **{
+            **reports.__dict__,
+            "periods": parse_report_config(
+                'periods:\n  - {name: Day, start: "06:00"}\n' '  - {name: Night, start: "22:00"}\n'
+            ).periods,
+        }
+    )
+    window, _, _, _ = writer_for(store, wrapping, NOON)._build(DAY)
+
+    bands = writer_for(store, wrapping, NOON)._bands(window)
+
+    assert [band.name for band in bands] == ["Night", "Day", "Night"]
+    assert bands[0].shade == bands[2].shade
+    assert bands[0].shade != bands[1].shade
+
+
+@pytest.mark.parametrize("day", [FALL_BACK, SPRING_FORWARD])
+def test_every_wall_clock_hour_gets_its_refresh_on_a_clock_change_day(
+    reports: ReportConfig, day: date
+) -> None:
+    """23 or 25 refreshes, one per hour as the hallway clock reads it."""
+    cursor = datetime.combine(day, time.min, tzinfo=NY).astimezone(UTC)
+    end = datetime.combine(day + timedelta(days=1), time.min, tzinfo=NY).astimezone(UTC)
+
+    seen: list[str] = []
+    while cursor < end:
+        cursor = next_refresh(cursor, reports)
+        if cursor >= end:
+            break
+        seen.append(f"{cursor.astimezone(NY):%H:%M}")
+
+    # Every hour from 01:00 to 23:00; midnight ends the day and stops the walk.
+    assert seen == [f"{hour:02d}:00" for hour in range(1, 24)]
+
+
+def test_the_day_ends_on_local_midnight_however_long_it_was(reports: ReportConfig) -> None:
+    for day in (FALL_BACK, SPRING_FORWARD, date(2026, 6, 1)):
+        last = datetime.combine(day, time(23, 30), tzinfo=NY)
+
+        wake = next_refresh(last.astimezone(UTC), reports).astimezone(NY)
+
+        assert wake == datetime.combine(day + timedelta(days=1), time.min, tzinfo=NY)
+
+
+def test_rebuilding_leaves_a_pruned_day_alone(store: EventStore, reports: ReportConfig) -> None:
+    """retention_days promises the counts survive; rebuild must not zero them."""
+    kept = ReportConfig(**{**reports.__dict__, "retention_days": 7})
+    old = at(9) - timedelta(days=30)
+    for n in range(5):
+        when = old + timedelta(minutes=n * 10)
+        store.start_event("cam-1", "Front Door", MOTION, when.astimezone(UTC))
+        store.end_event("cam-1", MOTION, (when + timedelta(seconds=30)).astimezone(UTC))
+    sheet = writer_for(store, kept, NOON)
+    sheet.write_day(old.date())
+    before = (reports.output_dir / f"{old.date()}.html").read_text()
+    sheet.refresh()
+
+    assert sheet.rebuild() >= 1
+    stored = store.summaries([old.date().isoformat()])[old.date().isoformat()]
+    summary = next(
+        row for row in stored if row.group_key == "front_of_house" and row.kind == MOTION
+    )
+    assert summary.events == 5
+    assert summary.seconds == 150.0
+    assert (reports.output_dir / f"{old.date()}.html").read_text() == before
+
+
+def test_write_day_declines_a_pruned_day(store: EventStore, reports: ReportConfig) -> None:
+    kept = ReportConfig(**{**reports.__dict__, "retention_days": 7})
+    old = at(9) - timedelta(days=30)
+    store.start_event("cam-1", "Front Door", MOTION, old.astimezone(UTC))
+    store.end_event("cam-1", MOTION, (old + timedelta(seconds=30)).astimezone(UTC))
+    sheet = writer_for(store, kept, NOON)
+    sheet.write_day(old.date())
+    sheet.refresh()
+
+    assert sheet.write_day(old.date()) is None
+
+
+def test_a_quiet_day_that_was_never_pruned_is_still_rendered(
+    store: EventStore, reports: ReportConfig
+) -> None:
+    """Absence of events is only "pruned" when counts were kept for that day."""
+    sheet = writer_for(store, reports, NOON)
+
+    assert sheet.write_day(DAY) is not None
+    assert sheet.write_day(DAY) is not None  # and again, now that it is summarised
+
+
+def test_the_earliest_sheet_does_not_link_to_a_page_that_was_never_written(
+    store: EventStore, reports: ReportConfig
+) -> None:
+    record(store, CAMERAS[0], MOTION, at(9), 30)
+
+    writer_for(store, reports, NOON).refresh()
+    html = (reports.output_dir / "2026-10-20.html").read_text()
+
+    assert "2026-10-19.html" not in html
+    assert not (reports.output_dir / "2026-10-19.html").exists()
+
+
+def test_neighbouring_days_do_link_to_each_other(store: EventStore, reports: ReportConfig) -> None:
+    for offset in range(3):
+        when = at(9) - timedelta(days=offset)
+        store.start_event("cam-1", "Front Door", MOTION, when.astimezone(UTC))
+        store.end_event("cam-1", MOTION, (when + timedelta(seconds=30)).astimezone(UTC))
+
+    writer_for(store, reports, NOON).rebuild()
+    middle = (reports.output_dir / "2026-10-19.html").read_text()
+
+    assert '<a href="2026-10-18.html">' in middle
+    assert '<a href="2026-10-20.html">' in middle
+    earliest = (reports.output_dir / "2026-10-18.html").read_text()
+    assert "2026-10-17.html" not in earliest
+
+
+def test_rebuild_does_not_link_forward_to_a_day_it_never_writes(
+    store: EventStore, reports: ReportConfig
+) -> None:
+    """Today only has a page once something writes one; rebuild may not assume it."""
+    record(store, CAMERAS[0], MOTION, at(9) - timedelta(days=1), 30)
+
+    writer_for(store, reports, NOON).rebuild()
+    yesterday = (reports.output_dir / "2026-10-19.html").read_text()
+
+    assert not (reports.output_dir / "2026-10-20.html").exists()
+    assert "2026-10-20.html" not in yesterday
+
+
+def test_rebuild_does_link_forward_when_today_has_a_page(
+    store: EventStore, reports: ReportConfig
+) -> None:
+    record(store, CAMERAS[0], MOTION, at(9) - timedelta(days=1), 30)
+    record(store, CAMERAS[0], MOTION, at(9), 30)
+
+    writer_for(store, reports, NOON).rebuild()
+    yesterday = (reports.output_dir / "2026-10-19.html").read_text()
+
+    assert (reports.output_dir / "2026-10-20.html").is_file()
+    assert '<a href="2026-10-20.html">' in yesterday
+
+
+def test_a_first_refresh_links_back_to_the_day_it_is_about_to_write(
+    store: EventStore, reports: ReportConfig
+) -> None:
+    """Yesterday has events but no summary yet; the back-link must not wait a pass."""
+    record(store, CAMERAS[0], MOTION, at(9) - timedelta(days=1), 30)
+    record(store, CAMERAS[0], MOTION, at(8), 30)
+
+    writer_for(store, reports, NOON).refresh()
+    today = (reports.output_dir / "2026-10-20.html").read_text()
+
+    assert (reports.output_dir / "2026-10-19.html").is_file()
+    assert '<a href="2026-10-19.html">' in today
+
+
+def test_every_neighbour_link_on_every_page_resolves(
+    store: EventStore, reports: ReportConfig
+) -> None:
+    """The property both of those are instances of."""
+    for offset in (0, 1, 3, 4):  # a deliberate gap at two days ago
+        when = at(9) - timedelta(days=offset)
+        store.start_event("cam-1", "Front Door", MOTION, when.astimezone(UTC))
+        store.end_event("cam-1", MOTION, (when + timedelta(seconds=30)).astimezone(UTC))
+    sheet = writer_for(store, reports, NOON)
+    sheet.rebuild()
+    sheet.refresh()
+
+    pages = sorted(reports.output_dir.glob("*.html"))
+    assert pages
+    for page in pages:
+        for link in re.findall(r'href="([^"]+\.html)"', page.read_text()):
+            assert (reports.output_dir / link).is_file(), f"{page.name} -> {link}"
