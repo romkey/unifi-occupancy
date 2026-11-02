@@ -258,6 +258,18 @@ def test_the_theme_control_is_offered_on_every_page() -> None:
             assert f'data-theme="{choice}"' in html
 
 
+def test_the_control_is_not_dressed_as_a_dead_end_nav_label() -> None:
+    """It sits in nav.days beside the disabled earlier/later labels.
+
+    Those are styled by element, and `nav.days span` outranks `.theme`, so an
+    unscoped rule renders an interactive control as a greyed-out dead end.
+    """
+    html = render_day(sheet(section()), REPORTS)
+
+    assert "nav.days span:not(.theme)" in html
+    assert "nav.days span {" not in html
+
+
 def test_the_control_stays_hidden_until_a_script_can_work_it() -> None:
     html = render_day(sheet(section()), REPORTS)
 

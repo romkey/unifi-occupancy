@@ -224,9 +224,11 @@ a { color: inherit; }
 .sub a { text-decoration-color: var(--line); }
 nav.days { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap;
   margin: 0 0 1.5rem; font-size: .85rem; }
-nav.days a, nav.days span { padding: .25rem .6rem; border: 1px solid var(--line);
-  border-radius: 999px; text-decoration: none; }
-nav.days span { color: var(--muted); border-style: dashed; }
+/* The dead-end "earlier"/"later" labels, not every span that lands in here:
+   the theme control is one too, and must not be dressed as a disabled link. */
+nav.days a, nav.days span:not(.theme) { padding: .25rem .6rem;
+  border: 1px solid var(--line); border-radius: 999px; text-decoration: none; }
+nav.days span:not(.theme) { color: var(--muted); border-style: dashed; }
 
 .cards { display: flex; flex-wrap: wrap; gap: .6rem; margin: 0 0 1.75rem; }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
