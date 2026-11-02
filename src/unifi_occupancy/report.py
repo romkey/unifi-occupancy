@@ -366,10 +366,15 @@ class SheetWriter:
         stored = self._store.summaries([day.isoformat()]).get(day.isoformat(), [])
         return any(row.events or row.seconds for row in stored)
 
-    def _sheets(self) -> set[str]:
-        """The days that have a page, so neighbour links never point at a 404."""
-        today = self._clock().astimezone(self._reports.tz).date()
-        return set(self._store.summarised_days()) | {today.isoformat()}
+    def _sheets(self, also: Iterable[date] = ()) -> set[str]:
+        """The days that have a page, so neighbour links never point at a 404.
+
+        ``also`` names the days this pass is about to write, which do not have
+        a stored summary yet. Nothing else may be assumed into this set -- a
+        day that is merely *probably* there is how a link comes to point at a
+        page nobody wrote.
+        """
+        return set(self._store.summarised_days()) | {day.isoformat() for day in also}
 
     def write_day(self, day: date, sheets: set[str] | None = None) -> Path | None:
         """Render one day. ``None`` when the day has been pruned and is left be."""
@@ -439,9 +444,12 @@ class SheetWriter:
         today = moment.astimezone(self._reports.tz).date()
         yesterday = today - timedelta(days=1)
 
-        self.write_day(today)
-        if self._has_history(yesterday):
-            self.write_day(yesterday)
+        # Both days are known before either is written, so today's back-link
+        # does not have to wait for the pass that writes yesterday.
+        writing = [today] + ([yesterday] if self._has_history(yesterday) else [])
+        known = self._sheets(writing)
+        for day in writing:
+            self.write_day(day, known)
         self.write_index()
         self._prune(today)
 
@@ -477,8 +485,8 @@ class SheetWriter:
                 days.add(cursor)
                 cursor += timedelta(days=1)
         # Worked out up front: a day's neighbour links have to know about days
-        # that have not been written yet this pass.
-        known = {day.isoformat() for day in days} | self._sheets()
+        # that have not been written yet this pass -- and about no others.
+        known = self._sheets(days)
         written = sum(1 for day in sorted(days) if self.write_day(day, known) is not None)
         self.write_index()
         if written != len(days):

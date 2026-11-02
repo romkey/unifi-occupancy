@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -547,3 +548,62 @@ def test_neighbouring_days_do_link_to_each_other(store: EventStore, reports: Rep
     assert '<a href="2026-10-20.html">' in middle
     earliest = (reports.output_dir / "2026-10-18.html").read_text()
     assert "2026-10-17.html" not in earliest
+
+
+def test_rebuild_does_not_link_forward_to_a_day_it_never_writes(
+    store: EventStore, reports: ReportConfig
+) -> None:
+    """Today only has a page once something writes one; rebuild may not assume it."""
+    record(store, CAMERAS[0], MOTION, at(9) - timedelta(days=1), 30)
+
+    writer_for(store, reports, NOON).rebuild()
+    yesterday = (reports.output_dir / "2026-10-19.html").read_text()
+
+    assert not (reports.output_dir / "2026-10-20.html").exists()
+    assert "2026-10-20.html" not in yesterday
+
+
+def test_rebuild_does_link_forward_when_today_has_a_page(
+    store: EventStore, reports: ReportConfig
+) -> None:
+    record(store, CAMERAS[0], MOTION, at(9) - timedelta(days=1), 30)
+    record(store, CAMERAS[0], MOTION, at(9), 30)
+
+    writer_for(store, reports, NOON).rebuild()
+    yesterday = (reports.output_dir / "2026-10-19.html").read_text()
+
+    assert (reports.output_dir / "2026-10-20.html").is_file()
+    assert '<a href="2026-10-20.html">' in yesterday
+
+
+def test_a_first_refresh_links_back_to_the_day_it_is_about_to_write(
+    store: EventStore, reports: ReportConfig
+) -> None:
+    """Yesterday has events but no summary yet; the back-link must not wait a pass."""
+    record(store, CAMERAS[0], MOTION, at(9) - timedelta(days=1), 30)
+    record(store, CAMERAS[0], MOTION, at(8), 30)
+
+    writer_for(store, reports, NOON).refresh()
+    today = (reports.output_dir / "2026-10-20.html").read_text()
+
+    assert (reports.output_dir / "2026-10-19.html").is_file()
+    assert '<a href="2026-10-19.html">' in today
+
+
+def test_every_neighbour_link_on_every_page_resolves(
+    store: EventStore, reports: ReportConfig
+) -> None:
+    """The property both of those are instances of."""
+    for offset in (0, 1, 3, 4):  # a deliberate gap at two days ago
+        when = at(9) - timedelta(days=offset)
+        store.start_event("cam-1", "Front Door", MOTION, when.astimezone(UTC))
+        store.end_event("cam-1", MOTION, (when + timedelta(seconds=30)).astimezone(UTC))
+    sheet = writer_for(store, reports, NOON)
+    sheet.rebuild()
+    sheet.refresh()
+
+    pages = sorted(reports.output_dir.glob("*.html"))
+    assert pages
+    for page in pages:
+        for link in re.findall(r'href="([^"]+\.html)"', page.read_text()):
+            assert (reports.output_dir / link).is_file(), f"{page.name} -> {link}"
