@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import UTC, date, datetime
 
 import pytest
@@ -159,10 +160,12 @@ def test_density_is_not_drawn_before_there_is_anything_to_scale_against() -> Non
 
 
 def test_camera_names_cannot_inject_markup() -> None:
-    html = render_day(sheet(section(name='<script>alert("x")</script>')), REPORTS)
+    clean = render_day(sheet(section()), REPORTS)
+    hostile = render_day(sheet(section(name='<script>alert("x")</script>')), REPORTS)
 
-    assert "<script>" not in html
-    assert "&lt;script&gt;" in html
+    # The page has scripts of its own, so count them rather than forbid them.
+    assert hostile.count("<script>") == clean.count("<script>")
+    assert "&lt;script&gt;" in hostile
 
 
 def test_a_day_with_no_earlier_neighbour_shows_a_dead_end_not_a_link() -> None:
@@ -216,3 +219,65 @@ def test_group_names_cannot_inject_markup_into_the_index() -> None:
 
 def test_the_filename_is_the_day() -> None:
     assert day_filename(DAY) == "2026-10-20.html"
+
+
+# ---------------------------------------------------------------------------
+# Light and dark
+# ---------------------------------------------------------------------------
+
+
+def test_the_page_follows_the_browser_by_default() -> None:
+    html = render_day(sheet(section()), REPORTS)
+
+    assert "@media (prefers-color-scheme: dark)" in html
+    assert "color-scheme: light dark" in html
+
+
+def test_a_chosen_theme_overrides_what_the_browser_asks_for() -> None:
+    html = render_day(sheet(section()), REPORTS)
+
+    # The browser's preference applies only while the reader has not overridden it.
+    assert ':root:not([data-theme="light"])' in html
+    assert ':root[data-theme="dark"]' in html
+
+
+def test_both_dark_rules_carry_the_same_palette() -> None:
+    """One source of truth, spliced twice -- the two must never drift."""
+    html = render_day(sheet(section()), REPORTS)
+
+    assert html.count("--bg: #15161a") == 2
+
+
+def test_the_theme_control_is_offered_on_every_page() -> None:
+    day = render_day(sheet(section()), REPORTS)
+    index = render_index([], [], REPORTS, NOW)
+
+    for html in (day, index):
+        assert 'id="theme"' in html
+        for choice in ("auto", "light", "dark"):
+            assert f'data-theme="{choice}"' in html
+
+
+def test_the_control_stays_hidden_until_a_script_can_work_it() -> None:
+    html = render_day(sheet(section()), REPORTS)
+
+    assert 'id="theme" role="group" aria-label="Colour theme" hidden' in html
+
+
+def test_the_chosen_theme_is_applied_before_the_first_paint() -> None:
+    """Reading storage after <body> would flash the wrong theme."""
+    html = render_day(sheet(section()), REPORTS)
+
+    assert html.index("localStorage.getItem") < html.index("<body>")
+
+
+def test_storage_access_is_guarded() -> None:
+    """A private window makes localStorage throw; the sheet must still render."""
+    html = render_day(sheet(section()), REPORTS)
+
+    assert html.count("try {") == html.count("catch (e) {}") >= 2
+    for match in re.finditer("localStorage", html):
+        prefix = html[: match.start()]
+        opened = prefix.rfind("try {")
+        assert opened != -1, "a storage access sits outside any try"
+        assert prefix.rfind("catch (e) {}") < opened, "its try block was already closed"

@@ -107,8 +107,18 @@ The current day's sheet is rewritten every `refresh_minutes` (by default on the 
 the last write of the day lands on local **midnight** — which both finalises the day that
 just ended and starts the new one. `index.html` is rewritten each time.
 
-Every page is self-contained: no JavaScript, no fonts, no CDN, light and dark. Any web
-server can serve the directory, and the files will still open in ten years.
+### Light and dark
+
+Pages follow the browser's own light/dark setting, and carry an **Auto / Light / Dark**
+control for overriding it — useful on a wall tablet whose OS theme is not what you want the
+sheet to be. The choice is remembered per browser and applies to every sheet.
+
+That control is the only JavaScript in a sheet: a dozen inline lines, no library. With
+scripts disabled it hides itself and the page still follows the browser, which is the
+behaviour you would have had anyway.
+
+Every page is otherwise self-contained: no fonts, no CDN, nothing fetched. Any web server
+can serve the directory, and the files will still open in ten years.
 
 ### Configuration
 

@@ -130,6 +130,68 @@ class IndexEntry:
         return sum(cell.counts.get(kind, 0) for cell in self.cells.values())
 
 
+#: The dark palette, spliced into both the "browser says dark" rule and the
+#: "reader chose dark" rule, so the two can never drift apart.
+DARK_VARS = """
+  --bg: #15161a; --fg: #e9e7e4; --muted: #99948e; --line: #2b2d33;
+  --card: #1c1e23; --shadow: rgba(0, 0, 0, .35);
+  --motion: #e79a41; --person: #6ca8e8;
+  --b0: rgba(255, 255, 255, .105); --b1: rgba(255, 255, 255, .050);
+  --b2: rgba(255, 255, 255, .011); --b3: rgba(255, 255, 255, .078);
+  --b4: rgba(255, 255, 255, .030); --b5: rgba(255, 255, 255, .062);
+"""
+
+#: Read before the first paint, so a chosen theme never flashes the other one.
+#: Every storage access is guarded: a private window or blocked site data makes
+#: these throw, and a sheet that will not render is worse than one that forgets.
+HEAD_SCRIPT = """
+(function () {
+  try {
+    var saved = localStorage.getItem("unifi-occupancy-theme");
+    if (saved === "light" || saved === "dark") {
+      document.documentElement.setAttribute("data-theme", saved);
+    }
+  } catch (e) {}
+})();
+"""
+
+#: Wires up the control and reveals it. Without this the control stays hidden,
+#: because a toggle that cannot toggle is worse than no toggle.
+BODY_SCRIPT = """
+(function () {
+  var KEY = "unifi-occupancy-theme";
+  var root = document.documentElement;
+  var bar = document.getElementById("theme");
+  if (!bar) return;
+  bar.hidden = false;
+  function paint() {
+    var chosen = root.getAttribute("data-theme") || "auto";
+    var buttons = bar.getElementsByTagName("button");
+    for (var i = 0; i < buttons.length; i++) {
+      buttons[i].setAttribute(
+        "aria-pressed", buttons[i].getAttribute("data-theme") === chosen ? "true" : "false"
+      );
+    }
+  }
+  bar.addEventListener("click", function (event) {
+    var button = event.target;
+    while (button && button !== bar && !button.getAttribute("data-theme")) {
+      button = button.parentNode;
+    }
+    if (!button || button === bar) return;
+    var choice = button.getAttribute("data-theme");
+    try {
+      if (choice === "auto") { localStorage.removeItem(KEY); }
+      else { localStorage.setItem(KEY, choice); }
+    } catch (e) {}
+    if (choice === "auto") { root.removeAttribute("data-theme"); }
+    else { root.setAttribute("data-theme", choice); }
+    paint();
+  });
+  paint();
+})();
+"""
+
 STYLE = """
 :root {
   color-scheme: light dark;
@@ -140,16 +202,14 @@ STYLE = """
   --b2: rgba(28, 27, 25, .014); --b3: rgba(28, 27, 25, .085);
   --b4: rgba(28, 27, 25, .034); --b5: rgba(28, 27, 25, .070);
 }
+/* What the browser asks for, unless the reader has said otherwise. */
 @media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #15161a; --fg: #e9e7e4; --muted: #99948e; --line: #2b2d33;
-    --card: #1c1e23; --shadow: rgba(0, 0, 0, .35);
-    --motion: #e79a41; --person: #6ca8e8;
-    --b0: rgba(255, 255, 255, .105); --b1: rgba(255, 255, 255, .050);
-    --b2: rgba(255, 255, 255, .011); --b3: rgba(255, 255, 255, .078);
-    --b4: rgba(255, 255, 255, .030); --b5: rgba(255, 255, 255, .062);
-  }
+  :root:not([data-theme="light"]) {/*DARK*/}
 }
+/* What the reader chose, whatever the browser asks for. */
+:root[data-theme="dark"] {/*DARK*/}
+:root[data-theme="dark"] { color-scheme: dark; }
+:root[data-theme="light"] { color-scheme: light; }
 * { box-sizing: border-box; }
 body {
   margin: 0; padding: 1.5rem 1.25rem 4rem; background: var(--bg); color: var(--fg);
@@ -247,12 +307,22 @@ table.index .z { color: var(--muted); }
   border-radius: 12px; padding: .25rem .75rem; box-shadow: 0 1px 2px var(--shadow); }
 .empty { color: var(--muted); font-size: .9rem; padding: 2rem 0; }
 
+.theme { margin-left: auto; display: inline-flex; border: 1px solid var(--line);
+  border-radius: 999px; overflow: hidden; padding: 0; }
+.theme[hidden] { display: none; }
+.theme button { font: inherit; font-size: .78rem; line-height: 1.5; padding: .25rem .65rem;
+  border: 0; background: transparent; color: var(--muted); cursor: pointer; }
+.theme button + button { border-left: 1px solid var(--line); }
+.theme button[aria-pressed="true"] { background: var(--b1); color: var(--fg); }
+.theme button:focus-visible { outline: 2px solid var(--person); outline-offset: -2px; }
+
 @media (max-width: 700px) {
   body { padding: 1.1rem .8rem 3rem; }
+  .theme { margin-left: 0; }
   .row, .rowaxis { grid-template-columns: 6.5rem 1fr; gap: .55rem; }
   .rl b { font-size: .8rem; }
 }
-"""
+""".replace("/*DARK*/", DARK_VARS)
 
 
 def _duration(seconds: float) -> str:
@@ -379,13 +449,27 @@ def _legend_html(bands: Sequence[BandSpan], peak: int) -> str:
     )
 
 
+def _theme_html() -> str:
+    """The Auto/Light/Dark control, hidden until a script can make it work."""
+    buttons = "".join(
+        f'<button type="button" data-theme="{choice}" aria-pressed="false">{label}</button>'
+        for choice, label in (("auto", "Auto"), ("light", "Light"), ("dark", "Dark"))
+    )
+    return (
+        '<span class="theme" id="theme" role="group" aria-label="Colour theme" hidden>'
+        f"{buttons}</span>"
+    )
+
+
 def _page(title: str, body: str) -> str:
     return (
         "<!doctype html>\n"
         '<html lang="en">\n<head>\n<meta charset="utf-8">\n'
         '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
-        f"<title>{escape(title)}</title>\n<style>{STYLE}</style>\n</head>\n"
-        f'<body>\n<div class="wrap">\n{body}\n</div>\n</body>\n</html>\n'
+        f"<title>{escape(title)}</title>\n<style>{STYLE}</style>\n"
+        f"<script>{HEAD_SCRIPT}</script>\n</head>\n"
+        f'<body>\n<div class="wrap">\n{body}\n</div>\n'
+        f"<script>{BODY_SCRIPT}</script>\n</body>\n</html>\n"
     )
 
 
@@ -410,6 +494,7 @@ def render_day(sheet: DaySheet, reports: ReportConfig) -> str:
         nav.append(f'<a href="{day_filename(sheet.next_day)}">{sheet.next_day} →</a>')
     else:
         nav.append("<span>later →</span>")
+    nav.append(_theme_html())
     nav.append("</nav>")
 
     cards = "".join(
@@ -452,6 +537,7 @@ def render_index(
     if not entries:
         body = (
             f"<h1>{escape(reports.title)}</h1>\n"
+            f'<nav class="days">{_theme_html()}</nav>\n'
             '<p class="empty">No days have been recorded yet. The first sheet appears '
             "within the hour.</p>"
         )
@@ -479,6 +565,7 @@ def render_index(
         f'<p class="sub">{_plural(len(entries), "day")} recorded · '
         f"updated {escape(generated)} · counts are "
         f"<b>motion / person</b> events</p>\n"
+        f'<nav class="days">{_theme_html()}</nav>\n'
         f'<div class="scroll"><table class="index">'
         f"<thead><tr><th>Day</th>{head}<th>All</th></tr></thead>"
         f'<tbody>{"".join(rows)}</tbody></table></div>'
