@@ -12,8 +12,15 @@ permissions:
   contents: read
   packages: write
 
+# Creating a release also creates its tag, so `gh release create` fires both
+# `release: published` and `push: tags` seconds apart. Both keys have to resolve
+# to the same group or the two runs do not see each other, race to push the same
+# four tags, and can leave `latest` on a different digest from the version tag --
+# which is exactly what happened to v0.2.0. `github.ref` is the tag's full ref on
+# a push and its short name nowhere, so it cannot be the key; `ref_name` is the
+# short name on both.
 concurrency:
-  group: docker-publish-${{ github.event.release.tag_name || github.ref }}
+  group: docker-publish-${{ github.event.release.tag_name || github.ref_name }}
   cancel-in-progress: true
 
 env:
