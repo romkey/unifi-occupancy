@@ -383,18 +383,26 @@ class SheetWriter:
             return None
         known = self._sheets() if sheets is None else sheets
         window, sections, peak, summaries = self._build(day)
-        today = self._clock().astimezone(self._reports.tz).date()
+        moment = self._clock()
+        today = moment.astimezone(self._reports.tz).date()
+        # Only a day that "now" falls inside gets the live edge: on a finished
+        # day there is nothing to the right of it to explain.
+        live = window.start <= moment < window.end
+        now_at = window.fraction(moment) if live else None
+        now_label = moment.astimezone(self._reports.tz).strftime("%H:%M") if live else ""
         previous_day = day - timedelta(days=1)
         next_day = day + timedelta(days=1)
         sheet = DaySheet(
             day=day,
             sections=sections,
-            generated_at=self._clock().astimezone(self._reports.tz),
+            generated_at=moment.astimezone(self._reports.tz),
             peak_bucket=peak,
             previous_day=previous_day if previous_day.isoformat() in known else None,
             next_day=next_day if day < today and next_day.isoformat() in known else None,
             bands=self._bands(window),
             axis=self._axis(window),
+            now=now_at,
+            now_label=now_label,
         )
         self._store.save_summaries(day.isoformat(), summaries)
         return self._write(day_filename(day), render_day(sheet, self._reports))

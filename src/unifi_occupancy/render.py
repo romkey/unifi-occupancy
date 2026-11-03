@@ -110,6 +110,11 @@ class DaySheet:
     next_day: date | None = None
     bands: tuple[BandSpan, ...] = ()
     axis: tuple[AxisMark, ...] = ()
+    #: Where "now" fell as a fraction of the day, on a day that is still being
+    #: written to. ``None`` on a finished day, which has no live edge to mark.
+    now: float | None = None
+    #: The wall-clock time ``now`` stands for, for the marker's label.
+    now_label: str = ""
 
 
 @dataclass(frozen=True)
@@ -135,7 +140,7 @@ class IndexEntry:
 DARK_VARS = """
   --bg: #15161a; --fg: #e9e7e4; --muted: #99948e; --line: #2b2d33;
   --card: #1c1e23; --shadow: rgba(0, 0, 0, .35);
-  --motion: #e79a41; --person: #6ca8e8;
+  --motion: #e79a41; --person: #6ca8e8; --now: #4cc273;
   --b0: rgba(255, 255, 255, .105); --b1: rgba(255, 255, 255, .050);
   --b2: rgba(255, 255, 255, .011); --b3: rgba(255, 255, 255, .078);
   --b4: rgba(255, 255, 255, .030); --b5: rgba(255, 255, 255, .062);
@@ -197,7 +202,7 @@ STYLE = """
   color-scheme: light dark;
   --bg: #fbfaf8; --fg: #1c1b19; --muted: #6d6964; --line: #e4dfd8;
   --card: #ffffff; --shadow: rgba(28, 27, 25, .06);
-  --motion: #c0711c; --person: #2566a4;
+  --motion: #c0711c; --person: #2566a4; --now: #1f8a4c;
   --b0: rgba(28, 27, 25, .115); --b1: rgba(28, 27, 25, .055);
   --b2: rgba(28, 27, 25, .014); --b3: rgba(28, 27, 25, .085);
   --b4: rgba(28, 27, 25, .034); --b5: rgba(28, 27, 25, .070);
@@ -275,12 +280,26 @@ section.group { background: var(--card); border: 1px solid var(--line); border-r
 .quiet { position: absolute; inset: 0; display: flex; align-items: center;
   justify-content: center; font-size: .68rem; color: var(--muted); }
 
+/* The live edge: one line through every track of a section, drawn over the
+   rows rather than inside each lane, so it reads as a single cut across all
+   the cameras in the group. */
+.plot { position: relative; }
+.nowwrap { position: absolute; inset: 0; pointer-events: none; }
+.nowcol { position: relative; height: 100%; }
+.now { position: absolute; top: 0; bottom: 0; left: 0; width: 2px; margin-left: -1px;
+  background: var(--now); }
+.now::before { content: ""; position: absolute; top: -3px; left: -2px; width: 6px;
+  height: 6px; border-radius: 50%; background: var(--now); }
+.axis .now { top: 0; bottom: auto; height: .55rem; }
+.axis .now::before { top: auto; bottom: -3px; }
+.legend .now-k .sw { background: var(--now); width: .4rem; height: 1rem; border-radius: 2px; }
+
 .axis { position: relative; height: 1.1rem; margin-top: .3rem; font-size: .68rem;
   color: var(--muted); font-variant-numeric: tabular-nums; }
 .axis span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
 .axis span:first-child { transform: none; }
 .axis span:last-child { transform: translateX(-100%); }
-.rowaxis { display: grid; grid-template-columns: 11rem 1fr; gap: .9rem; }
+.rowaxis, .nowwrap { display: grid; grid-template-columns: 11rem 1fr; gap: .9rem; }
 
 .legend { display: flex; flex-wrap: wrap; gap: 1.1rem; align-items: center;
   margin: 1.5rem 0 0; font-size: .78rem; color: var(--muted); }
@@ -321,7 +340,7 @@ table.index .z { color: var(--muted); }
 @media (max-width: 700px) {
   body { padding: 1.1rem .8rem 3rem; }
   .theme { margin-left: 0; }
-  .row, .rowaxis { grid-template-columns: 6.5rem 1fr; gap: .55rem; }
+  .row, .rowaxis, .nowwrap { grid-template-columns: 6.5rem 1fr; gap: .55rem; }
   .rl b { font-size: .8rem; }
 }
 """.replace("/*DARK*/", DARK_VARS)
@@ -401,15 +420,38 @@ def _row_html(row: Row, bands_html: str, peak: int) -> str:
     )
 
 
-def _axis_html(marks: Sequence[AxisMark]) -> str:
+def _now_line(at: float, label: str) -> str:
+    """The green rule itself, placed in a column that spans the tracks."""
+    title = f"Updated to {label}" if label else "Updated to here"
+    return f'<i class="now" style="left:{_pct(at)}%" ' f'title="{escape(title, quote=True)}"></i>'
+
+
+def _now_html(sheet: DaySheet) -> str:
+    """An overlay laid across a section's rows, on the same grid as a row.
+
+    Drawn once per section rather than once per lane: the point of the marker
+    is that it is one line, and a reader can follow it down past every camera
+    in the group to see where the day stops being history.
+    """
+    if sheet.now is None:
+        return ""
+    return (
+        f'<div class="nowwrap" aria-hidden="true"><div></div>'
+        f'<div class="nowcol">{_now_line(sheet.now, sheet.now_label)}</div></div>'
+    )
+
+
+def _axis_html(marks: Sequence[AxisMark], sheet: DaySheet) -> str:
     spans = "".join(
         f'<span style="left:{_pct(mark.at)}%">{escape(mark.label)}</span>' for mark in marks
     )
-    return f'<div class="rowaxis"><div></div><div class="axis">{spans}</div></div>'
+    marker = "" if sheet.now is None else _now_line(sheet.now, sheet.now_label)
+    return f'<div class="rowaxis"><div></div><div class="axis">{marker}{spans}</div></div>'
 
 
-def _section_html(section: Section, bands_html: str, peak: int, axis: str) -> str:
-    rows = "".join(_row_html(row, bands_html, peak) for row in section.rows)
+def _section_html(section: Section, bands_html: str, peak: int, axis: str, now: str) -> str:
+    tracks = "".join(_row_html(row, bands_html, peak) for row in section.rows)
+    rows = f'<div class="plot">{tracks}{now}</div>'
     totals = " · ".join(
         f"{escape(kind_for(kind).name)} {count}"
         for kind, count in section.totals.items()
@@ -424,7 +466,7 @@ def _section_html(section: Section, bands_html: str, peak: int, axis: str) -> st
     )
 
 
-def _legend_html(bands: Sequence[BandSpan], peak: int) -> str:
+def _legend_html(bands: Sequence[BandSpan], peak: int, sheet: DaySheet) -> str:
     kinds = "".join(
         f'<span class="k {escape(kind)}"><i class="sw"></i>{escape(kind_for(kind).name)}</span>'
         for kind in ALWAYS_RENDERED
@@ -445,8 +487,15 @@ def _legend_html(bands: Sequence[BandSpan], peak: int) -> str:
         if peak
         else "Upper strip: when a detection was active. Lower strip: events per bucket."
     )
+    live = (
+        ""
+        if sheet.now is None
+        else '<span class="k now-k"><i class="sw"></i>'
+        f'now{" " + escape(sheet.now_label) if sheet.now_label else ""}'
+        " \u2014 updated to here</span>"
+    )
     return (
-        f'<div class="legend">{kinds}{"".join(periods)}</div>'
+        f'<div class="legend">{kinds}{"".join(periods)}{live}</div>'
         f'<p class="sub" style="margin-top:.6rem">{escape(density)}</p>'
     )
 
@@ -482,7 +531,8 @@ def day_filename(day: date) -> str:
 def render_day(sheet: DaySheet, reports: ReportConfig) -> str:
     """Render one day's sheet."""
     bands_html = _bands_html(sheet.bands)
-    axis_html = _axis_html(sheet.axis)
+    now_html = _now_html(sheet)
+    axis_html = _axis_html(sheet.axis, sheet)
     heading = sheet.day.strftime("%A %-d %B %Y") if _supports_dash() else sheet.day.isoformat()
     title = f"{reports.title} — {sheet.day.isoformat()}"
 
@@ -510,7 +560,7 @@ def render_day(sheet: DaySheet, reports: ReportConfig) -> str:
         for section in sheet.sections
     )
     sections = "".join(
-        _section_html(section, bands_html, sheet.peak_bucket, axis_html)
+        _section_html(section, bands_html, sheet.peak_bucket, axis_html, now_html)
         for section in sheet.sections
     )
     if not sections:
@@ -524,7 +574,7 @@ def render_day(sheet: DaySheet, reports: ReportConfig) -> str:
         f'{"".join(nav)}\n'
         f'<div class="cards">{cards}</div>\n'
         f"{sections}\n"
-        f"{_legend_html(sheet.bands, sheet.peak_bucket)}"
+        f"{_legend_html(sheet.bands, sheet.peak_bucket, sheet)}"
     )
     return _page(title, body)
 

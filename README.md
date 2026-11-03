@@ -99,6 +99,10 @@ Behind both, the day is shaded into the **periods** you named — morning, after
 night, or whatever divisions suit the place. Motion and person always get strips; siren and
 smoke are recorded too, and appear on a day they actually fired.
 
+On the current day, a green vertical line runs down through every camera in a section at
+the time the sheet was last written: everything to the right of it is a day that has not
+happened yet, not a quiet one. A finished day has no line.
+
 Hovering a bar gives its exact times.
 
 ### When it writes
