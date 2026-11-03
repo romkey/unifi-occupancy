@@ -607,3 +607,43 @@ def test_every_neighbour_link_on_every_page_resolves(
     for page in pages:
         for link in re.findall(r'href="([^"]+\.html)"', page.read_text()):
             assert (reports.output_dir / link).is_file(), f"{page.name} -> {link}"
+
+
+# ---------------------------------------------------------------------------
+# The live edge
+# ---------------------------------------------------------------------------
+
+
+def test_todays_sheet_is_marked_where_the_updating_stopped(
+    store: EventStore, reports: ReportConfig
+) -> None:
+    writer_for(store, reports, NOON).write_day(DAY)
+
+    html = (reports.output_dir / "2026-10-20.html").read_text()
+
+    assert 'class="now" style="left:50%"' in html  # noon, halfway through the day
+    assert "Updated to 12:00" in html
+
+
+def test_a_day_that_is_over_carries_no_marker(store: EventStore, reports: ReportConfig) -> None:
+    store.start_event("cam-1", "Front Door", MOTION, at(9).astimezone(UTC))
+    store.end_event("cam-1", MOTION, at(9, 1).astimezone(UTC))
+    writer_for(store, reports, NOON + timedelta(days=1)).write_day(DAY)
+
+    html = (reports.output_dir / "2026-10-20.html").read_text()
+
+    assert 'class="now"' not in html
+
+
+def test_the_marker_follows_the_stretched_day_like_everything_else(
+    store: EventStore, reports: ReportConfig
+) -> None:
+    """25 hours on the fall-back day, so noon is not halfway through it."""
+    noon = datetime.combine(FALL_BACK, time(12, 0), tzinfo=NY)
+
+    writer_for(store, reports, noon).write_day(FALL_BACK)
+    html = (reports.output_dir / "2026-11-01.html").read_text()
+
+    found = re.search(r'class="now" style="left:([\d.]+)%', html)
+    assert found is not None
+    assert float(found.group(1)) == pytest.approx(13 / 25 * 100, abs=1e-3)

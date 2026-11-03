@@ -42,6 +42,8 @@ def sheet(
     peak: int = 2,
     bands: tuple[BandSpan, ...] = BANDS,
     previous_day: date | None = date(2026, 10, 19),
+    now: float | None = None,
+    now_label: str = "",
 ) -> DaySheet:
     return DaySheet(
         day=DAY,
@@ -52,7 +54,18 @@ def sheet(
         next_day=None,
         bands=bands,
         axis=AXIS,
+        now=now,
+        now_label=now_label,
     )
+
+
+TRACK = Track(
+    kind=MOTION,
+    segments=(Segment(0.25, 0.26, "06:00:00 \u2013 06:14:24 (864s)"),),
+    buckets=(0, 2, 1),
+    events=3,
+    seconds=864.0,
+)
 
 
 def section(name: str = "Front of house", **kwargs: object) -> Section:
@@ -293,3 +306,36 @@ def test_storage_access_is_guarded() -> None:
         opened = prefix.rfind("try {")
         assert opened != -1, "a storage access sits outside any try"
         assert prefix.rfind("catch (e) {}") < opened, "its try block was already closed"
+
+
+# ---------------------------------------------------------------------------
+# The live edge
+# ---------------------------------------------------------------------------
+
+
+def test_a_day_still_being_written_to_is_marked_where_it_stops() -> None:
+    html = render_day(sheet(section(), now=0.604166, now_label="14:30"), REPORTS)
+
+    assert 'class="now" style="left:60.4166%"' in html
+    assert "updated to here" in html
+    assert 'title="Updated to 14:30"' in html
+
+
+def test_the_marker_is_one_line_across_a_whole_group() -> None:
+    """One overlay per section, not one per lane: it has to read as a single cut."""
+    rows = (Row(label="Front Door", tracks=(TRACK,)), Row(label="Drive", tracks=(TRACK,)))
+    group = Section(key="front", name="Front", rows=rows, totals={MOTION: 3})
+
+    html = render_day(sheet(group, now=0.5), REPORTS)
+
+    assert html.count('class="nowwrap"') == 1
+    assert html.count('class="plot"') == 1
+    # Drawn after the rows it crosses, so nothing in a lane paints over it.
+    assert html.index('class="nowwrap"') > html.index('class="row"')
+
+
+def test_a_finished_day_has_no_marker() -> None:
+    html = render_day(sheet(section()), REPORTS)
+
+    assert 'class="now"' not in html
+    assert "updated to here" not in html
