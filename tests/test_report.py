@@ -647,3 +647,90 @@ def test_the_marker_follows_the_stretched_day_like_everything_else(
     found = re.search(r'class="now" style="left:([\d.]+)%', html)
     assert found is not None
     assert float(found.group(1)) == pytest.approx(13 / 25 * 100, abs=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# What the hover readout is told about the day
+# ---------------------------------------------------------------------------
+
+
+def test_an_ordinary_day_needs_no_correction(store: EventStore, reports: ReportConfig) -> None:
+    hand = writer_for(store, reports, NOON)
+    window, _, _, _ = hand._build(DAY)
+
+    assert window.seconds == 86_400
+    assert hand._shifts(window) == ()
+
+
+def test_the_morning_the_clocks_go_back_is_corrected_once(
+    store: EventStore, reports: ReportConfig
+) -> None:
+    end_of_day = datetime.combine(FALL_BACK, time(23, 59), tzinfo=NY)
+    hand = writer_for(store, reports, end_of_day)
+    window, _, _, _ = hand._build(FALL_BACK)
+
+    shifts = hand._shifts(window)
+
+    assert window.seconds == 90_000
+    assert len(shifts) == 1
+    at_fraction, delta = shifts[0]
+    assert delta == -3600
+    # 02:00 EDT is two hours into a 25-hour day.
+    assert at_fraction == pytest.approx(2 / 25)
+
+
+def test_the_morning_the_clocks_go_forward_is_corrected_once(
+    store: EventStore, reports: ReportConfig
+) -> None:
+    end_of_day = datetime.combine(SPRING_FORWARD, time(23, 59), tzinfo=NY)
+    hand = writer_for(store, reports, end_of_day)
+    window, _, _, _ = hand._build(SPRING_FORWARD)
+
+    shifts = hand._shifts(window)
+
+    assert window.seconds == 82_800
+    assert shifts == ((pytest.approx(2 / 23), 3600),)
+
+
+@pytest.mark.parametrize("day", [DAY, FALL_BACK, SPRING_FORWARD])
+def test_the_readout_reads_back_the_wall_clock(
+    store: EventStore, reports: ReportConfig, day: date
+) -> None:
+    """The arithmetic the page's script does, done here against the real zone.
+
+    Walked over instants rather than over labelled hours, because on the
+    morning the clocks go forward there is no 02:30 to ask about. Every
+    position on a lane must read back as the time the hallway clock showed at
+    that moment -- that is the whole contract between the page and this.
+    """
+    end_of_day = datetime.combine(day, time(23, 59), tzinfo=NY)
+    hand = writer_for(store, reports, end_of_day)
+    window, _, _, _ = hand._build(day)
+    shifts = hand._shifts(window)
+
+    step = timedelta(minutes=30)
+    moment = window.start
+    while moment < window.end:
+        fraction = window.fraction(moment)
+        elapsed = fraction * window.seconds
+        for at_fraction, delta in shifts:
+            if fraction >= at_fraction:
+                elapsed += delta
+        local = moment.astimezone(NY)
+        expected = local.hour * 3600 + local.minute * 60 + local.second
+        assert round(elapsed) % 86_400 == expected, f"{day} {local:%H:%M}"
+        moment += step
+
+
+def test_the_day_written_out_tells_its_sheet_how_long_it_was(
+    store: EventStore, reports: ReportConfig
+) -> None:
+    end_of_day = datetime.combine(FALL_BACK, time(23, 59), tzinfo=NY)
+    record(store, CAMERAS[0], MOTION, datetime.combine(FALL_BACK, time(9), tzinfo=NY), 30)
+
+    page = writer_for(store, reports, end_of_day).write_day(FALL_BACK)
+
+    assert page is not None
+    html = page.read_text(encoding="utf-8")
+    assert 'data-seconds="90000"' in html
+    assert 'data-shifts="[[0.080000,-3600]]"' in html
