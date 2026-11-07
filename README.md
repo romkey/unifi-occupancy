@@ -103,7 +103,14 @@ On the current day, a green vertical line runs down through every camera in a se
 the time the sheet was last written: everything to the right of it is a day that has not
 happened yet, not a quiet one. A finished day has no line.
 
-Hovering a bar gives its exact times.
+Hovering a bar gives its exact times. Hovering anywhere else over a group's timelines
+draws a **red rule** down through every camera in it, labelled with the moment under the
+pointer — so a bar can be read off the lane it is drawn on instead of squinting at the
+three-hourly axis below. The reading is in the reporting timezone, not the reader's, and it
+is right on the two days a year the clocks change, when a day is 23 or 25 hours long.
+
+The **count cards** at the top of a page are links: click one to jump to that group's
+timelines, which is worth having once a page carries a dozen groups.
 
 ### When it writes
 
@@ -117,9 +124,10 @@ Pages follow the browser's own light/dark setting, and carry an **Auto / Light /
 control for overriding it — useful on a wall tablet whose OS theme is not what you want the
 sheet to be. The choice is remembered per browser and applies to every sheet.
 
-That control is the only JavaScript in a sheet: a dozen inline lines, no library. With
-scripts disabled it hides itself and the page still follows the browser, which is the
-behaviour you would have had anyway.
+That control and the hover rule are the only JavaScript in a sheet: a few dozen inline
+lines, no library. With scripts disabled the control hides itself and the page still follows
+the browser, the hover rule simply never appears, and everything else — the bars, the
+density, the period shading, the card links — is plain HTML and works regardless.
 
 Every page is otherwise self-contained: no fonts, no CDN, nothing fetched. Any web server
 can serve the directory, and the files will still open in ten years.

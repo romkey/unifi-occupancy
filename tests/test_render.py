@@ -339,3 +339,99 @@ def test_a_finished_day_has_no_marker() -> None:
 
     assert 'class="now"' not in html
     assert "updated to here" not in html
+
+
+# ---------------------------------------------------------------------------
+# The hover readout
+# ---------------------------------------------------------------------------
+
+
+def test_every_group_carries_a_readout_over_its_lanes_and_its_axis() -> None:
+    """One chart per section, with the rule and its label inside it."""
+    html = render_day(sheet(section("Front"), section("Back")), REPORTS)
+
+    assert html.count('class="chart"') == 2
+    assert html.count('class="hoverwrap"') == 2
+    assert html.count('class="hover"') == 2
+    assert html.count('class="hovertip"') == 2
+    # Inside the chart, after the lanes and the axis it is drawn across.
+    chart = html[html.index('class="chart"') :]
+    assert chart.index('class="hoverwrap"') > chart.index('class="axis"')
+
+
+def test_the_readout_is_told_how_long_the_day_was() -> None:
+    """A 24-hour day and no clock changes: the mapping is a plain multiply."""
+    html = render_day(sheet(section()), REPORTS)
+
+    assert 'data-seconds="86400"' in html
+    assert 'data-shifts="[]"' in html
+
+
+def test_a_clock_change_travels_to_the_readout() -> None:
+    page = DaySheet(
+        day=DAY,
+        sections=(section(),),
+        generated_at=NOW,
+        axis=AXIS,
+        day_seconds=90_000.0,
+        shifts=((0.08, -3600.0),),
+    )
+
+    html = render_day(page, REPORTS)
+
+    assert 'data-seconds="90000"' in html
+    assert 'data-shifts="[[0.080000,-3600]]"' in html
+
+
+def test_the_readout_never_swallows_a_segments_own_tooltip() -> None:
+    html = render_day(sheet(section()), REPORTS)
+
+    assert "pointer-events: none" in html
+
+
+def test_the_readout_is_hidden_until_a_pointer_finds_it() -> None:
+    """Nothing to see on a sheet opened without a pointer, or without script."""
+    html = render_day(sheet(section()), REPORTS)
+
+    assert ".hoverwrap { position: absolute; inset: 0; pointer-events: none;" in html
+    assert "visibility: hidden" in html
+    assert ".chart.hot .hoverwrap { visibility: visible; }" in html
+
+
+# ---------------------------------------------------------------------------
+# The cards at the top
+# ---------------------------------------------------------------------------
+
+
+def test_each_card_links_down_to_the_group_it_counts() -> None:
+    html = render_day(sheet(section()), REPORTS)
+
+    assert '<a class="card" href="#front">' in html
+    assert '<section class="group" id="front">' in html
+
+
+def test_a_card_link_survives_a_group_name_that_needs_escaping() -> None:
+    odd = Section(
+        key='front"&',
+        name="Front",
+        rows=(Row(label="", tracks=(TRACK,)),),
+        totals={MOTION: 3},
+    )
+
+    html = render_day(sheet(odd), REPORTS)
+
+    assert 'href="#front&quot;&amp;"' in html
+    assert 'id="front&quot;&amp;"' in html
+
+
+def test_the_index_has_no_cards_to_link_from() -> None:
+    """Only a day page has groups to jump to; the index is a table of days."""
+    entry = IndexEntry(
+        day=DAY,
+        href=day_filename(DAY),
+        cells={"front": IndexCell(group_key="front", group_name="Front", counts={MOTION: 3})},
+    )
+
+    html = render_index((entry,), (("front", "Front"),), REPORTS, NOW)
+
+    assert 'class="card"' not in html

@@ -17,6 +17,7 @@ import logging
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta, tzinfo
+from itertools import pairwise
 from pathlib import Path
 
 from .config import MINUTES_PER_DAY, ReportConfig
@@ -255,6 +256,48 @@ class SheetWriter:
             for hour in range(0, 25, step_hours)
         )
 
+    @staticmethod
+    def _offset_at(moment: datetime, zone: tzinfo) -> float:
+        offset = moment.astimezone(zone).utcoffset()
+        return 0.0 if offset is None else offset.total_seconds()
+
+    def _shifts(self, window: _Window) -> tuple[tuple[float, float], ...]:
+        """Where the clocks moved in this day, and by how much.
+
+        The hover readout turns a position on a lane back into a wall-clock
+        time, and on the two days a year the clocks change it cannot do that by
+        multiplying out a fraction of 24 hours. These are the corrections it
+        applies: an empty tuple on all the other days.
+
+        Found by probing each hour and then bisecting the one that disagrees
+        with itself, rather than by asking the zone for its transitions --
+        ``tzinfo`` is not obliged to tell us, and a wrong answer here moves the
+        readout by an hour without moving anything it reads.
+        """
+        zone = self._reports.tz
+        probes: list[datetime] = []
+        cursor = window.start
+        while cursor < window.end:
+            probes.append(cursor)
+            cursor += timedelta(hours=1)
+        probes.append(window.end)
+
+        shifts: list[tuple[float, float]] = []
+        for earlier, later in pairwise(probes):
+            before = self._offset_at(earlier, zone)
+            after = self._offset_at(later, zone)
+            if before == after:
+                continue
+            low, high = earlier, later
+            while high - low > timedelta(seconds=1):
+                middle = low + (high - low) / 2
+                if self._offset_at(middle, zone) == before:
+                    low = middle
+                else:
+                    high = middle
+            shifts.append((window.fraction(high), after - before))
+        return tuple(shifts)
+
     def _segment_title(self, start: float, end: float, window: _Window) -> str:
         """Hover text for one segment; ``start`` and ``end`` are seconds into the day."""
         zone = self._reports.tz
@@ -403,6 +446,8 @@ class SheetWriter:
             axis=self._axis(window),
             now=now_at,
             now_label=now_label,
+            day_seconds=window.seconds,
+            shifts=self._shifts(window),
         )
         self._store.save_summaries(day.isoformat(), summaries)
         return self._write(day_filename(day), render_day(sheet, self._reports))

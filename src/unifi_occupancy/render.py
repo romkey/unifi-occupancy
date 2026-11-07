@@ -115,6 +115,14 @@ class DaySheet:
     now: float | None = None
     #: The wall-clock time ``now`` stands for, for the marker's label.
     now_label: str = ""
+    #: How long the day really was, in seconds: 86400 on most days, 82800 or
+    #: 90000 on the two the clocks change on. The hover readout turns a
+    #: position on a lane back into a time with it.
+    day_seconds: float = 86_400.0
+    #: ``(fraction, delta_seconds)`` for every clock change in the day, so the
+    #: readout can say 02:30 twice on the morning the clocks go back instead of
+    #: sliding an hour out from the lanes it is reading.
+    shifts: tuple[tuple[float, float], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -140,7 +148,7 @@ class IndexEntry:
 DARK_VARS = """
   --bg: #15161a; --fg: #e9e7e4; --muted: #99948e; --line: #2b2d33;
   --card: #1c1e23; --shadow: rgba(0, 0, 0, .35);
-  --motion: #e79a41; --person: #6ca8e8; --now: #4cc273;
+  --motion: #e79a41; --person: #6ca8e8; --now: #4cc273; --hover: #ff5d52;
   --b0: rgba(255, 255, 255, .105); --b1: rgba(255, 255, 255, .050);
   --b2: rgba(255, 255, 255, .011); --b3: rgba(255, 255, 255, .078);
   --b4: rgba(255, 255, 255, .030); --b5: rgba(255, 255, 255, .062);
@@ -197,12 +205,64 @@ BODY_SCRIPT = """
 })();
 """
 
+#: The hover readout. Follows the pointer across a group's timelines and says
+#: which moment of the day sits under it, so a bar can be read off the lane it
+#: is drawn on instead of against the three-hourly axis below.
+#:
+#: The mapping from a position to a time is done here rather than with
+#: ``Date``: the sheet is written in the reporting timezone, which is not
+#: necessarily the reader's, and a day is not necessarily 24 hours long. Both
+#: facts travel on the chart as data attributes -- how long the day was, and
+#: where in it the clocks moved -- which is all the arithmetic needs.
+HOVER_SCRIPT = """
+(function () {
+  var charts = document.getElementsByClassName("chart");
+  function pad(value) { return (value < 10 ? "0" : "") + value; }
+  function clock(fraction, seconds, shifts) {
+    var elapsed = fraction * seconds;
+    for (var i = 0; i < shifts.length; i++) {
+      if (fraction >= shifts[i][0]) { elapsed += shifts[i][1]; }
+    }
+    var total = ((Math.round(elapsed) % 86400) + 86400) % 86400;
+    return pad(Math.floor(total / 3600)) + ":" + pad(Math.floor(total % 3600 / 60))
+      + ":" + pad(total % 60);
+  }
+  function wire(chart) {
+    var column = chart.getElementsByClassName("hovercol")[0];
+    if (!column) return;
+    var line = column.getElementsByClassName("hover")[0];
+    var tip = column.getElementsByClassName("hovertip")[0];
+    var seconds = parseFloat(chart.getAttribute("data-seconds")) || 86400;
+    var shifts = [];
+    try { shifts = JSON.parse(chart.getAttribute("data-shifts") || "[]"); } catch (e) {}
+    function hide() { chart.classList.remove("hot"); }
+    function move(event) {
+      if (event.pointerType === "touch") { hide(); return; }
+      var box = column.getBoundingClientRect();
+      if (!box.width) { hide(); return; }
+      var fraction = (event.clientX - box.left) / box.width;
+      if (fraction < 0 || fraction > 1) { hide(); return; }
+      var at = (fraction * 100).toFixed(4) + "%";
+      line.style.left = at;
+      tip.style.left = at;
+      tip.className = "hovertip" + (fraction < 0.05 ? " s" : fraction > 0.95 ? " e" : "");
+      tip.textContent = clock(fraction, seconds, shifts);
+      chart.classList.add("hot");
+    }
+    chart.addEventListener("pointermove", move);
+    chart.addEventListener("pointerleave", hide);
+    chart.addEventListener("pointercancel", hide);
+  }
+  for (var i = 0; i < charts.length; i++) { wire(charts[i]); }
+})();
+"""
+
 STYLE = """
 :root {
   color-scheme: light dark;
   --bg: #fbfaf8; --fg: #1c1b19; --muted: #6d6964; --line: #e4dfd8;
   --card: #ffffff; --shadow: rgba(28, 27, 25, .06);
-  --motion: #c0711c; --person: #2566a4; --now: #1f8a4c;
+  --motion: #c0711c; --person: #2566a4; --now: #1f8a4c; --hover: #d2342a;
   --b0: rgba(28, 27, 25, .115); --b1: rgba(28, 27, 25, .055);
   --b2: rgba(28, 27, 25, .014); --b3: rgba(28, 27, 25, .085);
   --b4: rgba(28, 27, 25, .034); --b5: rgba(28, 27, 25, .070);
@@ -238,13 +298,21 @@ nav.days span:not(.theme) { color: var(--muted); border-style: dashed; }
 .cards { display: flex; flex-wrap: wrap; gap: .6rem; margin: 0 0 1.75rem; }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
   padding: .6rem .8rem; min-width: 8.5rem; box-shadow: 0 1px 2px var(--shadow); }
+/* A card is a link down to the group it counts, and has to stay legible as
+   one: the browser's own link colour and underline would fight the numbers. */
+a.card { display: block; color: inherit; text-decoration: none; }
+a.card:hover, a.card:focus-visible { border-color: var(--person); }
+a.card:focus-visible { outline: 2px solid var(--person); outline-offset: 2px; }
 .card b { display: block; font-size: .78rem; font-weight: 600; color: var(--muted);
   text-transform: uppercase; letter-spacing: .04em; margin-bottom: .25rem; }
 .card .n { font-variant-numeric: tabular-nums; font-size: .9rem; }
 .card .n span { color: var(--muted); }
 
 section.group { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
-  padding: 1rem 1.1rem 1.15rem; margin: 0 0 1rem; box-shadow: 0 1px 2px var(--shadow); }
+  padding: 1rem 1.1rem 1.15rem; margin: 0 0 1rem; box-shadow: 0 1px 2px var(--shadow);
+  /* Jumped to from a card, so it must not land flush against the viewport. */
+  scroll-margin-top: 1rem; }
+section.group:target { border-color: var(--person); }
 .ghead { display: flex; justify-content: space-between; align-items: baseline;
   gap: 1rem; flex-wrap: wrap; margin-bottom: .9rem; }
 .ghead .t { color: var(--muted); font-size: .82rem; font-variant-numeric: tabular-nums; }
@@ -294,12 +362,29 @@ section.group { background: var(--card); border: 1px solid var(--line); border-r
 .axis .now::before { top: auto; bottom: -3px; }
 .legend .now-k .sw { background: var(--now); width: .4rem; height: 1rem; border-radius: 2px; }
 
+/* The hover readout: a rule under the pointer, through the group's lanes and
+   its axis, labelled with the moment it is standing on. Hidden until a script
+   has somewhere to put it, and never in the way of a segment's own tooltip. */
+.chart { position: relative; }
+.hoverwrap { position: absolute; inset: 0; pointer-events: none; visibility: hidden; }
+.chart.hot .hoverwrap { visibility: visible; }
+.hovercol { position: relative; }
+.hover { position: absolute; top: 0; bottom: 0; left: 0; width: 2px; margin-left: -1px;
+  background: var(--hover); }
+.hovertip { position: absolute; bottom: -.1rem; left: 0; transform: translateX(-50%);
+  background: var(--hover); color: #fff; font-size: .66rem; line-height: 1.3;
+  padding: .1rem .3rem; border-radius: 3px; white-space: nowrap;
+  font-variant-numeric: tabular-nums; }
+.hovertip.s { transform: none; }
+.hovertip.e { transform: translateX(-100%); }
+
 .axis { position: relative; height: 1.1rem; margin-top: .3rem; font-size: .68rem;
   color: var(--muted); font-variant-numeric: tabular-nums; }
 .axis span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
 .axis span:first-child { transform: none; }
 .axis span:last-child { transform: translateX(-100%); }
-.rowaxis, .nowwrap { display: grid; grid-template-columns: 11rem 1fr; gap: .9rem; }
+.rowaxis, .nowwrap, .hoverwrap { display: grid; grid-template-columns: 11rem 1fr;
+  gap: .9rem; }
 
 .legend { display: flex; flex-wrap: wrap; gap: 1.1rem; align-items: center;
   margin: 1.5rem 0 0; font-size: .78rem; color: var(--muted); }
@@ -340,7 +425,7 @@ table.index .z { color: var(--muted); }
 @media (max-width: 700px) {
   body { padding: 1.1rem .8rem 3rem; }
   .theme { margin-left: 0; }
-  .row, .rowaxis, .nowwrap { grid-template-columns: 6.5rem 1fr; gap: .55rem; }
+  .row, .rowaxis, .nowwrap, .hoverwrap { grid-template-columns: 6.5rem 1fr; gap: .55rem; }
   .rl b { font-size: .8rem; }
 }
 """.replace("/*DARK*/", DARK_VARS)
@@ -367,6 +452,16 @@ def _plural(count: int, noun: str) -> str:
 def _pct(value: float) -> str:
     """A percentage with enough precision for a one-second event on a day."""
     return f"{max(0.0, min(100.0, value * 100)):.4f}".rstrip("0").rstrip(".") or "0"
+
+
+def _shifts_json(shifts: Sequence[tuple[float, float]]) -> str:
+    """The clock changes as a JSON array, for the hover readout to read back.
+
+    Written by hand rather than with :mod:`json` so the numbers come out in the
+    same compact shape the rest of the markup uses, and so an empty day costs
+    exactly two characters.
+    """
+    return "[" + ",".join(f"[{at:.6f},{delta:.0f}]" for at, delta in shifts) + "]"
 
 
 def _bands_html(bands: Sequence[BandSpan]) -> str:
@@ -449,9 +544,27 @@ def _axis_html(marks: Sequence[AxisMark], sheet: DaySheet) -> str:
     return f'<div class="rowaxis"><div></div><div class="axis">{marker}{spans}</div></div>'
 
 
-def _section_html(section: Section, bands_html: str, peak: int, axis: str, now: str) -> str:
+def _hover_html() -> str:
+    """The readout's own elements, laid on the same grid as a row.
+
+    Rendered empty and positioned by script: a sheet opened with scripting off
+    is still a sheet, and this is the one thing on it that cannot work without
+    a pointer to follow.
+    """
+    return (
+        '<div class="hoverwrap" aria-hidden="true"><div></div>'
+        '<div class="hovercol"><i class="hover"></i><b class="hovertip"></b></div></div>'
+    )
+
+
+def _section_html(
+    section: Section, bands_html: str, peak: int, axis: str, now: str, chart_data: str
+) -> str:
     tracks = "".join(_row_html(row, bands_html, peak) for row in section.rows)
     rows = f'<div class="plot">{tracks}{now}</div>'
+    # The rows and the axis under them are one chart, so the hover rule can run
+    # from the top lane down past the hour labels as a single cut.
+    rows = f'<div class="chart"{chart_data}>{rows}{axis}{_hover_html()}</div>'
     totals = " · ".join(
         f"{escape(kind_for(kind).name)} {count}"
         for kind, count in section.totals.items()
@@ -461,7 +574,7 @@ def _section_html(section: Section, bands_html: str, peak: int, axis: str, now: 
         f'<section class="group" id="{escape(section.key, quote=True)}">'
         f'<div class="ghead"><h2>{escape(section.name)}</h2>'
         f'<div class="t">{totals}</div></div>'
-        f"{rows}{axis}"
+        f"{rows}"
         f"</section>"
     )
 
@@ -520,7 +633,7 @@ def _page(title: str, body: str) -> str:
         f"<title>{escape(title)}</title>\n<style>{STYLE}</style>\n"
         f"<script>{HEAD_SCRIPT}</script>\n</head>\n"
         f'<body>\n<div class="wrap">\n{body}\n</div>\n'
-        f"<script>{BODY_SCRIPT}</script>\n</body>\n</html>\n"
+        f"<script>{BODY_SCRIPT}{HOVER_SCRIPT}</script>\n</body>\n</html>\n"
     )
 
 
@@ -549,18 +662,25 @@ def render_day(sheet: DaySheet, reports: ReportConfig) -> str:
     nav.append(_theme_html())
     nav.append("</nav>")
 
+    # Each card is a link down to the timelines it counts: on a page with a
+    # dozen groups the summary at the top is also the way into them.
     cards = "".join(
-        f'<div class="card"><b>{escape(section.name)}</b><div class="n">'
+        f'<a class="card" href="#{escape(section.key, quote=True)}">'
+        f'<b>{escape(section.name)}</b><div class="n">'
         + "<br>".join(
             f"{escape(kind_for(kind).name)} <span>{count}</span>"
             for kind, count in section.totals.items()
             if kind in ALWAYS_RENDERED or count
         )
-        + "</div></div>"
+        + "</div></a>"
         for section in sheet.sections
     )
+    chart_data = (
+        f' data-seconds="{sheet.day_seconds:.0f}"'
+        f' data-shifts="{escape(_shifts_json(sheet.shifts), quote=True)}"'
+    )
     sections = "".join(
-        _section_html(section, bands_html, sheet.peak_bucket, axis_html, now_html)
+        _section_html(section, bands_html, sheet.peak_bucket, axis_html, now_html, chart_data)
         for section in sheet.sections
     )
     if not sections:
