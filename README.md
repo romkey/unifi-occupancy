@@ -112,10 +112,21 @@ hardware and carries the fields HA has no use for. Both are published only when 
 
 ### Home Assistant
 
-Autodiscovery is on by default. Each camera arrives as one HA **device** carrying eight
-binary sensors — four detections, plus four diagnostic "…Detection Enabled" sensors. Nothing
-needs to be added to `configuration.yaml`. Set `HA_DISCOVERY_ENABLED=false` if you would
-rather wire the topics up by hand.
+Autodiscovery is on by default, and nothing needs to be added to `configuration.yaml`. Set
+`HA_DISCOVERY_ENABLED=false` if you would rather wire the topics up by hand.
+
+Each camera arrives as one HA **device** carrying nine entities: four detection binary
+sensors, four diagnostic "…Detection Enabled" sensors, and a diagnostic **Camera Info**
+sensor whose state is the model and whose attributes are the whole `info` payload — MAC,
+firmware, hardware, and which detections the hardware has. The identity fields also reach HA
+as the device's own `model`, `sw_version` and MAC, so Settings → Devices shows them without
+opening an entity.
+
+The service itself arrives as a device of its own, **UniFi Occupancy** — a bridge, in HA's
+sense — carrying two diagnostic sensors: **Service Version**, whose attributes are the whole
+`unifi-occupancy/info` payload (console, MQTT layout, which features are on), and **Protect
+Version**. Those are what you want in front of you when something is off, and without this
+device they would live only on a topic HA never reads.
 
 ## Is the camera still looking at anything?
 
