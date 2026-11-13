@@ -303,6 +303,11 @@ Any camera not named in a group gets a section of its own, so you can group the 
 worth grouping and leave the rest alone. A camera that is removed from Protect keeps its
 place on the days it was there.
 
+**Every camera is listed, whether or not anything happened to it.** A door that was never
+opened is a result — an empty lane says so, and a camera missing from the page does not. The
+roster is kept in the database alongside the events, so this holds for `--rebuild-sheets`
+too, which has no controller to ask.
+
 Quote the times. Unquoted ones happen to parse correctly too — YAML reads `18:00` as
 1080, which is already minutes past midnight — but a bare `6` means 00:06, not 06:00.
 
@@ -319,7 +324,8 @@ docker compose exec unifi-occupancy python -m unifi_occupancy --rebuild-sheets
 ```
 
 That reads the history and writes the pages; it needs neither the controller nor the
-broker.
+broker. Cameras that have never fired are listed from the stored roster, so a rebuild looks
+the same as a live refresh.
 
 ## How it works
 
@@ -453,7 +459,7 @@ mosquitto_sub -h localhost -t 'unifi-occupancy/#' -v
 | `health.py` | The optional vision check: snapshot, ask, verdict, schedule |
 | `publisher.py` | Topic layout, change detection, retraction |
 | `recorder.py` | Published state → detection edges worth keeping |
-| `store.py` | The SQLite detection history and per-day summaries |
+| `store.py` | The SQLite detection history, camera roster and per-day summaries |
 | `report.py` | Grouping, the timeline arithmetic, the refresh schedule |
 | `render.py` | View models → self-contained HTML |
 | `app.py` | The poll, event and sheet loops |

@@ -41,11 +41,19 @@ class EventRecorder:
         self._kinds = kinds
         self._clock = clock
         self._active: set[tuple[str, str]] = set()
+        #: Last name written to the roster per camera, so a poll that changed
+        #: nothing costs no write.
+        self._roster: dict[str, str] = {}
         self._complained = False
+        #: Separate from ``_complained``: a roster write that fails must not
+        #: swallow the first warning about the event log, or the other way
+        #: round. They fail for the same reasons but they are not the same loss.
+        self._roster_complained = False
 
     def observe(self, state: CameraState) -> None:
         camera = state.camera
         now = self._clock()
+        self._note(camera.id, camera.name, now)
         for kind in self._kinds:
             pair = (camera.id, kind)
             active = state.active(kind)
@@ -67,9 +75,29 @@ class EventRecorder:
             else:
                 self._active.discard(pair)
 
+    def _note(self, camera_id: str, camera_name: str, now: datetime) -> None:
+        """Keep the roster current so quiet cameras still reach the sheets."""
+        if self._roster.get(camera_id) == camera_name:
+            return
+        try:
+            self._store.record_camera(camera_id, camera_name, now)
+        except Exception as exc:  # noqa: BLE001 - history is not worth a crash
+            if not self._roster_complained:
+                logger.warning("could not record the camera roster: %s", exc)
+                self._roster_complained = True
+            return
+        self._roster_complained = False
+        self._roster[camera_id] = camera_name
+
     def forget(self, camera_ids: frozenset[str]) -> None:
         """Close out cameras that have gone away so they do not stay latched."""
         now = self._clock()
+        try:
+            self._store.forget_cameras(camera_ids)
+        except Exception as exc:  # noqa: BLE001 - as above
+            logger.warning("could not drop %d camera(s) from the roster: %s", len(camera_ids), exc)
+        for camera_id in camera_ids:
+            self._roster.pop(camera_id, None)
         for pair in [pair for pair in self._active if pair[0] in camera_ids]:
             try:
                 self._store.end_event(pair[0], pair[1], now)
