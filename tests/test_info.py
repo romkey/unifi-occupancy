@@ -135,3 +135,19 @@ async def test_service_info_is_not_republished_unchanged(
 
     await publisher.publish_service_info(meta=META, camera_count=2)
     assert len(transport.messages) == before + 1
+
+
+async def test_retracting_a_camera_clears_its_retained_metadata(
+    config: Config, transport: FakeTransport
+) -> None:
+    camera = parse_camera(camera_payload())
+    publisher = StatePublisher(config, transport)
+    state = DetectionTracker(hold_seconds=30.0).snapshot(camera, now=1.0)
+    await publisher.publish_state(state)
+
+    await publisher.retract([camera])
+
+    # An empty retained payload is how a retained topic is taken off a broker;
+    # otherwise the inventory would describe a camera that is no longer there.
+    assert transport.payload_for("unifi-occupancy/front_door/info") is None
+    assert transport.payload_for("unifi-occupancy/front_door/attributes") is None

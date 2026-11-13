@@ -98,6 +98,14 @@ class StatePublisher:
             if self._config.discovery.enabled:
                 for message in removal_messages(self._config, camera):
                     await self._send(message.topic, None, force=True)
+            # Clear the retained metadata too. These two describe a camera that
+            # exists; left on the broker they would outlive it, and `info` is
+            # meant to be an inventory of what is there now.
+            for topic in (
+                info_topic(self._config.mqtt, camera),
+                attributes_topic(self._config.mqtt, camera),
+            ):
+                await self._send(topic, None, force=True)
             self._announced.discard(camera.id)
             prefix = f"{self._config.mqtt.topic_prefix}/{camera.slug}/"
             for topic in [key for key in self._published if key.startswith(prefix)]:
