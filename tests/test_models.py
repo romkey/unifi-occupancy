@@ -24,7 +24,8 @@ def test_parse_camera_reads_identity() -> None:
     assert camera.id == "cam-1"
     assert camera.name == "Front Door"
     assert camera.slug == "front_door"
-    assert camera.model == "G4 Doorbell Pro"
+    assert camera.model == "camera"
+    assert camera.hardware == "UVC G4 Doorbell Pro"
     assert camera.mac == "AABBCCDDEEFF"
     assert camera.connected is True
 

@@ -117,10 +117,15 @@ Autodiscovery is on by default, and nothing needs to be added to `configuration.
 
 Each camera arrives as one HA **device** carrying nine entities: four detection binary
 sensors, four diagnostic "…Detection Enabled" sensors, and a diagnostic **Camera Info**
-sensor whose state is the model and whose attributes are the whole `info` payload — MAC,
-firmware, hardware, and which detections the hardware has. The identity fields also reach HA
-as the device's own `model`, `sw_version` and MAC, so Settings → Devices shows them without
+sensor whose state is the hardware model and whose attributes are the whole `info` payload —
+MAC, firmware, and which detections the hardware has. The identity fields also reach HA as
+the device's own `model`, `sw_version` and MAC, so Settings → Devices shows them without
 opening an entity.
+
+Both the entity state and the device's model are Protect's `type` (`UVC G4 Doorbell Pro`),
+not its `modelKey` — Protect answers `modelKey` with the bare word `camera` for every
+camera. `model` is still published on `info` and `attributes` unchanged, with `hardware`
+alongside it.
 
 The service itself arrives as a device of its own, **UniFi Occupancy** — a bridge, in HA's
 sense — carrying two diagnostic sensors: **Service Version**, whose attributes are the whole
@@ -475,8 +480,8 @@ controller and no broker.
   health check: one frame per camera per interval, sent to the endpoint you configured,
   held in memory for the length of that one request, and never published to MQTT, written
   to disk or logged. Leave the variable unset and no snapshot is ever taken.
-- Published attributes are limited to camera id, name, model, connection state, last motion
-  time and which detections the hardware supports.
+- Published attributes are limited to camera id, name, model, hardware, connection state,
+  last motion time and which detections the hardware supports.
 - The `info` topics add the console's name, type, version and uptime, and each camera's MAC,
   firmware and hardware model. Both are allowlists; nothing is forwarded from Protect that
   is not named in `info.py`.

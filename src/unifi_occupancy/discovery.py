@@ -51,7 +51,10 @@ def device_block(config: Config, camera: Camera) -> dict[str, Any]:
         "identifiers": [f"{node}_{camera.id}"],
         "name": camera.name,
         "manufacturer": MANUFACTURER,
-        "model": camera.model or "UniFi Protect Camera",
+        # `type` first: Protect's `modelKey` is "camera" for every camera, so
+        # it tells a reader nothing. `model` is kept as the fallback for a
+        # controller version that does not send `type`.
+        "model": camera.hardware or camera.model or "UniFi Protect Camera",
     }
     if camera.firmware:
         device["sw_version"] = camera.firmware
@@ -228,9 +231,11 @@ def discovery_messages(config: Config, camera: Camera) -> list[DiscoveryMessage]
                 "unique_id": _unique_id(config, camera, "info"),
                 "object_id": _object_id(config, camera, "info"),
                 "state_topic": info_topic(config.mqtt, camera),
-                # The model is the one field short and stable enough to be a
-                # state; everything else in `info` rides along as attributes.
-                "value_template": "{{ value_json.model | default('unknown', true) }}",
+                # The hardware model is the one field short and stable enough
+                # to be a state; everything else in `info` rides along as
+                # attributes. Not `model`, which Protect answers with the bare
+                # word "camera".
+                "value_template": ("{{ value_json.hardware or value_json.model or 'unknown' }}"),
                 "json_attributes_topic": info_topic(config.mqtt, camera),
                 "entity_category": "diagnostic",
             },
@@ -261,6 +266,10 @@ def attributes_payload(camera: Camera) -> dict[str, Any]:
         "camera_id": camera.id,
         "camera_name": camera.name,
         "model": camera.model,
+        # Alongside `model` rather than instead of it: `model` is what Protect
+        # calls the kind of device ("camera"), and anything already reading it
+        # should keep getting the same answer.
+        "hardware": camera.hardware,
         "connected": camera.connected,
         "last_motion": camera.last_motion.isoformat() if camera.last_motion else None,
         "supported": {kind_for(key).key: camera.is_supported(key) for key in camera.supported},
