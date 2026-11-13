@@ -20,6 +20,7 @@ from .topics import (
     attributes_topic,
     detection_topic,
     enabled_topic,
+    health_topic,
 )
 
 MANUFACTURER = "Ubiquiti"
@@ -54,23 +55,67 @@ def _object_id(config: Config, camera: Camera, suffix: str) -> str:
     return f"{config.discovery.node_id}_{camera.slug}_{suffix}"
 
 
-def _config_topic(config: Config, camera: Camera, suffix: str) -> str:
+def _config_topic(
+    config: Config, camera: Camera, suffix: str, component: str = "binary_sensor"
+) -> str:
     return (
-        f"{config.discovery.prefix}/binary_sensor/"
+        f"{config.discovery.prefix}/{component}/"
         f"{config.discovery.node_id}_{camera.slug}/{suffix}/config"
     )
 
 
-def _common(config: Config, camera: Camera) -> dict[str, Any]:
+def _device(config: Config, camera: Camera) -> dict[str, Any]:
     return {
         "device": device_block(config, camera),
         "availability_topic": config.mqtt.availability_topic,
         "payload_available": PAYLOAD_AVAILABLE,
         "payload_not_available": PAYLOAD_UNAVAILABLE,
+    }
+
+
+def _common(config: Config, camera: Camera) -> dict[str, Any]:
+    return {
+        **_device(config, camera),
         "payload_on": PAYLOAD_ON,
         "payload_off": PAYLOAD_OFF,
         "json_attributes_topic": attributes_topic(config.mqtt, camera),
     }
+
+
+def health_messages(config: Config, camera: Camera) -> list[DiscoveryMessage]:
+    """The two health entities: the verdict itself, and "is there a problem".
+
+    Only published when the health check is switched on -- there is no sense in
+    giving Home Assistant an entity that will never have a state.
+    """
+    topic = health_topic(config.mqtt, camera)
+    verdict = {
+        **_device(config, camera),
+        "name": "Camera Health",
+        "unique_id": _unique_id(config, camera, "health"),
+        "object_id": _object_id(config, camera, "health"),
+        "state_topic": topic,
+        "value_template": "{{ value_json.health }}",
+        "json_attributes_topic": topic,
+        "entity_category": "diagnostic",
+    }
+    problem = {
+        **_common(config, camera),
+        "name": "Camera Health Problem",
+        "unique_id": _unique_id(config, camera, "health_problem"),
+        "object_id": _object_id(config, camera, "health_problem"),
+        "state_topic": topic,
+        # Only an explicit "bad" is a problem; an unknown verdict means the
+        # check could not be made, which is not the same as a blocked camera.
+        "value_template": ("{{ 'ON' if value_json.health == 'bad' else 'OFF' }}"),
+        "json_attributes_topic": topic,
+        "device_class": "problem",
+        "entity_category": "diagnostic",
+    }
+    return [
+        DiscoveryMessage(_config_topic(config, camera, "health", "sensor"), verdict),
+        DiscoveryMessage(_config_topic(config, camera, "health_problem"), problem),
+    ]
 
 
 def discovery_messages(config: Config, camera: Camera) -> list[DiscoveryMessage]:
@@ -102,6 +147,8 @@ def discovery_messages(config: Config, camera: Camera) -> list[DiscoveryMessage]
                 },
             )
         )
+    if config.health.enabled:
+        messages.extend(health_messages(config, camera))
     return messages
 
 

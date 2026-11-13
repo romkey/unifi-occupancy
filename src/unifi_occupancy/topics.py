@@ -35,5 +35,9 @@ def attributes_topic(mqtt: MqttConfig, camera: Camera) -> str:
     return f"{camera_base(mqtt, camera)}/attributes"
 
 
+def health_topic(mqtt: MqttConfig, camera: Camera) -> str:
+    return f"{camera_base(mqtt, camera)}/health"
+
+
 def payload_for(value: bool) -> str:
     return PAYLOAD_ON if value else PAYLOAD_OFF

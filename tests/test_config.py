@@ -269,3 +269,72 @@ def test_the_config_file_path_comes_from_the_environment() -> None:
     assert load_config({**MINIMAL, "CONFIG_FILE": "/etc/occ.yaml"}).config_file == Path(
         "/etc/occ.yaml"
     )
+
+
+def test_the_health_check_is_off_by_default() -> None:
+    health = load_config(MINIMAL).health
+
+    assert health.enabled is False
+    assert health.api_key is None
+    assert health.base_url == "https://api.openai.com/v1"
+    assert health.interval_minutes == 60.0
+
+
+def test_the_health_check_reads_its_environment() -> None:
+    health = load_config(
+        {
+            **MINIMAL,
+            "CAMERA_HEALTH_ENABLED": "true",
+            "CAMERA_HEALTH_API_BASE_URL": "http://ollama.local:11434/v1/",
+            "CAMERA_HEALTH_API_KEY": "sk-test",
+            "CAMERA_HEALTH_MODEL": "qwen2.5vl",
+            "CAMERA_HEALTH_PROMPT": "is it ok?",
+            "CAMERA_HEALTH_INTERVAL_MINUTES": "15",
+            "CAMERA_HEALTH_HIGH_QUALITY_SNAPSHOT": "true",
+        }
+    ).health
+
+    assert health.enabled is True
+    assert health.model == "qwen2.5vl"
+    assert health.prompt == "is it ok?"
+    assert health.api_key == "sk-test"
+    assert health.interval_minutes == 15.0
+    assert health.interval_seconds == 900.0
+    assert health.high_quality_snapshot is True
+    # The trailing slash must not double up.
+    assert health.completions_url == "http://ollama.local:11434/v1/chat/completions"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"CAMERA_HEALTH_API_BASE_URL": "ollama.local:11434"},
+        {"CAMERA_HEALTH_INTERVAL_MINUTES": "0"},
+        {"CAMERA_HEALTH_REQUEST_TIMEOUT": "-1"},
+    ],
+)
+def test_a_switched_on_health_check_validates_its_settings(overrides: dict[str, str]) -> None:
+    with pytest.raises(ConfigError):
+        load_config({**MINIMAL, "CAMERA_HEALTH_ENABLED": "true", **overrides})
+
+
+def test_a_blank_model_or_prompt_falls_back_to_the_default() -> None:
+    health = load_config(
+        {
+            **MINIMAL,
+            "CAMERA_HEALTH_ENABLED": "true",
+            "CAMERA_HEALTH_MODEL": " ",
+            "CAMERA_HEALTH_PROMPT": "  ",
+        }
+    ).health
+
+    assert health.model == "gpt-4o-mini"
+    assert health.prompt.startswith("You are inspecting")
+
+
+def test_a_switched_off_health_check_does_not_validate_its_settings() -> None:
+    # Half-finished settings left behind by someone trying it out must not stop
+    # the service from starting with the feature off.
+    config = load_config({**MINIMAL, "CAMERA_HEALTH_API_BASE_URL": "not-a-url"})
+
+    assert config.health.enabled is False

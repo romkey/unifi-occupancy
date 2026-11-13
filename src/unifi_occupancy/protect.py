@@ -1,9 +1,14 @@
 """Thin async client for the UniFi Protect integration API.
 
 Uses the API-key authenticated ``/proxy/protect/integration/v1`` surface, which
-is read-only and does not require a user login. We only ever call the metadata
-and camera endpoints and subscribe to the event stream -- no video, no
-snapshots, no RTSP.
+is read-only and does not require a user login. The metadata and camera
+endpoints and the event stream are all this needs for occupancy: no video, no
+RTSP.
+
+:meth:`ProtectClient.get_snapshot` is the one exception, and it exists only for
+the optional camera health check (``CAMERA_HEALTH_ENABLED``). Nothing calls it
+unless that feature is switched on, and the bytes it returns go to the
+configured vision endpoint and nowhere else -- never to MQTT, never to disk.
 """
 
 from __future__ import annotations
@@ -115,6 +120,31 @@ class ProtectClient:
 
     async def get_cameras(self) -> list[Camera]:
         return parse_cameras(await self._get("/cameras"))
+
+    async def get_snapshot(self, camera_id: str, *, high_quality: bool = False) -> bytes | None:
+        """One JPEG frame from a camera, for the optional health check.
+
+        ``None`` when the controller will not give us one -- an API key without
+        the camera-snapshot permission, or a camera that is offline -- so a
+        missing frame is reported as an unknown verdict rather than crashing the
+        sweep.
+        """
+        quality = "true" if high_quality else "false"
+        path = f"/cameras/{camera_id}/snapshot?highQuality={quality}"
+        try:
+            response = await self._client.get(path, headers={"Accept": "image/jpeg"})
+        except httpx.HTTPError as exc:
+            raise ProtectError(f"snapshot request for {camera_id} failed: {exc}") from exc
+
+        if response.status_code in (401, 403):
+            raise ProtectAuthError(
+                f"Protect refused a snapshot for {camera_id} ({response.status_code}); "
+                "the API key may not carry camera snapshot permission"
+            )
+        if response.status_code >= 400:
+            logger.debug("snapshot for %s returned %s", camera_id, response.status_code)
+            return None
+        return response.content or None
 
     async def events(self) -> AsyncIterator[DetectionEvent]:
         """Yield detection events from the Protect websocket until it closes.

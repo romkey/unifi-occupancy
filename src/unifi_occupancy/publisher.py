@@ -14,6 +14,7 @@ from typing import Any, Protocol
 
 from .config import Config
 from .discovery import attributes_payload, discovery_messages, removal_messages
+from .health import HealthVerdict
 from .info import camera_info_payload, service_info_payload
 from .models import DETECTION_KEYS, Camera
 from .state import CameraState
@@ -23,6 +24,7 @@ from .topics import (
     attributes_topic,
     detection_topic,
     enabled_topic,
+    health_topic,
     info_topic,
     payload_for,
     service_info_topic,
@@ -131,6 +133,19 @@ class StatePublisher:
         await self._send(
             info_topic(self._config.mqtt, camera),
             json.dumps(camera_info_payload(camera), sort_keys=True),
+        )
+
+    async def publish_health(self, camera: Camera, verdict: HealthVerdict) -> None:
+        """Publish one camera's health verdict.
+
+        Forced rather than change-suppressed: an hourly "still good" is how a
+        consumer tells a healthy camera from one this process stopped checking,
+        and ``checked_at`` would defeat the suppression anyway.
+        """
+        await self._send(
+            health_topic(self._config.mqtt, camera),
+            json.dumps(verdict.payload(), sort_keys=True),
+            force=True,
         )
 
     async def publish_all(self, states: Sequence[CameraState]) -> None:
