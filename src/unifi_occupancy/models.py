@@ -99,6 +99,8 @@ class Camera:
     id: str
     name: str
     model: str | None = None
+    #: Protect's own hardware model string (``type``), e.g. ``UVC G4 Doorbell``.
+    hardware: str | None = None
     mac: str | None = None
     firmware: str | None = None
     connected: bool = True
@@ -199,6 +201,7 @@ def parse_camera(payload: Mapping[str, Any]) -> Camera:
         id=str(payload.get("id") or payload.get("mac") or ""),
         name=str(payload.get("name") or payload.get("id") or "camera"),
         model=payload.get("modelKey") if isinstance(payload.get("modelKey"), str) else None,
+        hardware=payload.get("type") if isinstance(payload.get("type"), str) else None,
         mac=payload.get("mac") if isinstance(payload.get("mac"), str) else None,
         firmware=(
             payload.get("firmwareVersion")

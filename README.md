@@ -40,6 +40,7 @@ so you can tell "nobody is there" apart from "nobody is looking".
 
 ```
 unifi-occupancy/status                        online | offline   (last will)
+unifi-occupancy/info                          {"service": "unifi-occupancy", ...}
 unifi-occupancy/<camera>/motion               ON | OFF
 unifi-occupancy/<camera>/motion_enabled       ON | OFF
 unifi-occupancy/<camera>/person               ON | OFF
@@ -49,10 +50,64 @@ unifi-occupancy/<camera>/siren_enabled        ON | OFF
 unifi-occupancy/<camera>/smoke                ON | OFF
 unifi-occupancy/<camera>/smoke_enabled        ON | OFF
 unifi-occupancy/<camera>/attributes           {"camera_name": "Front Door", ...}
+unifi-occupancy/<camera>/info                 {"mac": "...", "firmware": "...", ...}
 ```
 
 `<camera>` is the camera's Protect name, lowercased with non-alphanumerics collapsed to
 underscores: *Front Door* → `front_door`.
+
+### Metadata
+
+Two retained JSON topics describe the setup rather than its state, so anything on the
+broker can inventory a controller without asking Protect anything.
+
+`unifi-occupancy/info` is this service: its version, the Protect application version it is
+talking to, the console behind it, the MQTT layout it is publishing under, which optional
+features are switched on, and how many cameras it can see.
+
+```json
+{
+  "service": "unifi-occupancy",
+  "version": "0.5.0",
+  "protect": {
+    "host": "192.168.1.1",
+    "port": 443,
+    "api": "integration/v1",
+    "application_version": "6.3.52",
+    "console": { "name": "Dream Machine", "type": "UDMPRO", "version": "6.3.52" }
+  },
+  "mqtt": { "topic_prefix": "unifi-occupancy", "retain": true, "qos": 0 },
+  "features": { "websocket": true, "ha_discovery": true, "occupancy_sheets": true },
+  "detections": ["motion", "person", "siren", "smoke"],
+  "cameras": 7
+}
+```
+
+The console block is read from `/nvrs` and is an explicit allowlist — name, type, version,
+firmware, hardware platform, timezone, uptime — not whatever Protect happened to return. A
+controller that does not expose that endpoint simply has no `console` key.
+
+`unifi-occupancy/<camera>/info` is one camera as a *device*: id, name, slug, model, Protect's
+hardware string, MAC, firmware, whether it is connected, and for each detection whether the
+hardware has it and whether it is switched on.
+
+```json
+{
+  "camera_id": "661a...",
+  "name": "Front Door",
+  "slug": "front_door",
+  "model": "camera",
+  "hardware": "UVC G4 Doorbell Pro",
+  "mac": "AABBCCDDEEFF",
+  "firmware": "4.70.55",
+  "connected": true,
+  "detections": { "motion": { "supported": true, "enabled": true }, "...": {} }
+}
+```
+
+This overlaps `attributes` deliberately: `attributes` is what Home Assistant shows on an
+entity and moves whenever `last_motion` does, while `info` is the static description of the
+hardware and carries the fields HA has no use for. Both are published only when they change.
 
 ### Home Assistant
 
@@ -314,6 +369,7 @@ mosquitto_sub -h localhost -t 'unifi-occupancy/#' -v
 | `state.py` | Combining polls and events into per-camera detection state |
 | `protect.py` | Read-only Protect HTTP + websocket client |
 | `discovery.py` | Home Assistant discovery payloads |
+| `info.py` | The `info` metadata payloads for the service and each camera |
 | `publisher.py` | Topic layout, change detection, retraction |
 | `recorder.py` | Published state → detection edges worth keeping |
 | `store.py` | The SQLite detection history and per-day summaries |
@@ -326,10 +382,13 @@ controller and no broker.
 
 ## Privacy notes
 
-- Only `/meta/info` and `/cameras` are read, plus the event subscription. Video, snapshot
-  and stream endpoints are never called.
+- Only `/meta/info`, `/nvrs` and `/cameras` are read, plus the event subscription. Video,
+  snapshot and stream endpoints are never called.
 - Published attributes are limited to camera id, name, model, connection state, last motion
   time and which detections the hardware supports.
+- The `info` topics add the console's name, type, version and uptime, and each camera's MAC,
+  firmware and hardware model. Both are allowlists; nothing is forwarded from Protect that
+  is not named in `info.py`.
 - The API key exists only in the process environment. It is not logged and not published.
 - Nothing subscribes to MQTT; this process only writes.
 - The occupancy sheets record camera names, detection kinds and timestamps. Nothing else is

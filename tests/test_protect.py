@@ -106,3 +106,51 @@ def test_websocket_url_is_derived_from_config() -> None:
     assert CONFIG.websocket_url == (
         "wss://protect.example:443/proxy/protect/integration/v1/subscribe/events"
     )
+
+
+async def test_get_console_reads_the_nvr_list() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/nvrs")
+        return httpx.Response(200, json=[{"name": "Dream Machine", "version": "6.3.52"}])
+
+    async with client_for(handler) as client:
+        console = await client.get_console()
+
+    assert console is not None
+    assert console["name"] == "Dream Machine"
+
+
+async def test_get_console_accepts_a_bare_object() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"name": "Cloud Key"})
+
+    async with client_for(handler) as client:
+        console = await client.get_console()
+
+    assert console == {"name": "Cloud Key"}
+
+
+async def test_get_console_is_none_when_unsupported() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"error": "not found"})
+
+    async with client_for(handler) as client:
+        assert await client.get_console() is None
+
+
+async def test_an_unsupported_endpoint_still_raises_on_other_errors() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="boom")
+
+    async with client_for(handler) as client:
+        with pytest.raises(ProtectError):
+            await client.get_console()
+
+
+async def test_get_console_still_reports_a_rejected_key() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, text="nope")
+
+    async with client_for(handler) as client:
+        with pytest.raises(ProtectAuthError):
+            await client.get_console()

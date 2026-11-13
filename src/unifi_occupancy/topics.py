@@ -15,6 +15,14 @@ def camera_base(mqtt: MqttConfig, camera: Camera) -> str:
     return f"{mqtt.topic_prefix}/{camera.slug}"
 
 
+def service_info_topic(mqtt: MqttConfig) -> str:
+    return f"{mqtt.topic_prefix}/info"
+
+
+def info_topic(mqtt: MqttConfig, camera: Camera) -> str:
+    return f"{camera_base(mqtt, camera)}/info"
+
+
 def detection_topic(mqtt: MqttConfig, camera: Camera, key: str) -> str:
     return f"{camera_base(mqtt, camera)}/{key}"
 
