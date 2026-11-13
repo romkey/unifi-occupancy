@@ -7,7 +7,8 @@ import contextlib
 import logging
 import ssl
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
+from typing import Any
 
 import aiomqtt
 
@@ -57,12 +58,16 @@ class OccupancyService:
         publisher: StatePublisher,
         clock: Callable[[], float] = time.monotonic,
         recorder: EventRecorder | None = None,
+        meta: Mapping[str, Any] | None = None,
+        console: Mapping[str, Any] | None = None,
     ) -> None:
         self._config = config
         self._protect = protect
         self._publisher = publisher
         self._clock = clock
         self._recorder = recorder
+        self._meta = meta
+        self._console = console
         self._tracker = DetectionTracker(hold_seconds=config.detection_hold_seconds)
         self._cameras: dict[str, Camera] = {}
         self._lock = asyncio.Lock()
@@ -84,6 +89,11 @@ class OccupancyService:
                 await self._publisher.retract(gone)
             self._cameras = seen
             await self._publish_locked(cameras)
+            await self._publisher.publish_service_info(
+                meta=self._meta,
+                console=self._console,
+                camera_count=len(seen),
+            )
 
     async def _publish_locked(self, cameras: list[Camera]) -> None:
         now = self._clock()
@@ -157,22 +167,53 @@ async def run(config: Config) -> None:
     async with ProtectClient(config.protect) as protect:
         meta = await protect.get_meta()
         logger.info("connected to UniFi Protect %s", meta.get("applicationVersion", "(unknown)"))
+        console = await _console_info(protect)
 
         store = _open_store(config)
         try:
-            await _serve(config, protect, store)
+            await _serve(config, protect, store, meta=meta, console=console)
         finally:
             if store is not None:
                 store.close()
 
 
-async def _serve(config: Config, protect: ProtectClient, store: EventStore | None) -> None:
+async def _console_info(protect: ProtectClient) -> dict[str, Any] | None:
+    """The console's description, or ``None`` if it will not tell us.
+
+    Published as metadata and nothing more, so failing to read it must never
+    stop the service from starting.
+    """
+    try:
+        return await protect.get_console()
+    except ProtectAuthError:
+        raise
+    except ProtectError as exc:
+        logger.debug("could not read console info: %s", exc)
+        return None
+
+
+async def _serve(
+    config: Config,
+    protect: ProtectClient,
+    store: EventStore | None,
+    *,
+    meta: Mapping[str, Any] | None = None,
+    console: Mapping[str, Any] | None = None,
+) -> None:
     recorder = EventRecorder(store) if store is not None else None
 
     async with mqtt_client(config) as client:
         publisher = StatePublisher(config, AiomqttTransport(client))
         await publisher.publish_availability(True)
-        service = OccupancyService(config, protect, publisher, recorder=recorder)
+        service = OccupancyService(
+            config,
+            protect,
+            publisher,
+            recorder=recorder,
+            meta=meta,
+            console=console,
+        )
+        await publisher.publish_service_info(meta=meta, console=console)
 
         tasks = [asyncio.create_task(service.poll_forever(), name="poll")]
         if config.protect.use_websocket:

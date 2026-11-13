@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -241,3 +242,15 @@ def test_a_configured_run_opens_the_store_and_tidies_up_after_a_crash(
         assert event.ended_at is not None
     finally:
         store.close()
+
+
+async def test_refresh_publishes_the_service_info_topic(
+    config: Config, transport: FakeTransport
+) -> None:
+    service, _ = service_for(config, transport, [[camera_payload()]])
+
+    await service.refresh()
+
+    payload = transport.payload_for("unifi-occupancy/info")
+    assert payload is not None
+    assert json.loads(payload)["cameras"] == 1

@@ -74,7 +74,7 @@ class ProtectClient:
         if self._owns_client:
             await self._client.aclose()
 
-    async def _get(self, path: str) -> Any:
+    async def _get(self, path: str, *, optional: bool = False) -> Any:
         try:
             response = await self._client.get(path)
         except httpx.HTTPError as exc:
@@ -84,6 +84,11 @@ class ProtectClient:
             raise ProtectAuthError(
                 f"Protect rejected the API key ({response.status_code}) for {path}"
             )
+        if optional and response.status_code == 404:
+            # Not every controller version exposes every endpoint; an absent
+            # one is a fact about the console, not an error.
+            logger.debug("%s is not available on this controller", path)
+            return None
         if response.status_code >= 400:
             raise ProtectError(f"Protect returned {response.status_code} for {path}")
         try:
@@ -95,6 +100,18 @@ class ProtectClient:
         """Controller metadata -- used as a cheap credential/connectivity check."""
         payload = await self._get("/meta/info")
         return payload if isinstance(payload, dict) else {}
+
+    async def get_console(self) -> dict[str, Any] | None:
+        """The console's own description, when this controller exposes ``/nvrs``.
+
+        Older Protect versions do not, and the integration API may return a bare
+        object rather than a list, so both shapes and the absence of the endpoint
+        all resolve to "nothing to say" rather than to a failure.
+        """
+        payload = await self._get("/nvrs", optional=True)
+        if isinstance(payload, list):
+            payload = next((item for item in payload if isinstance(item, dict)), None)
+        return payload if isinstance(payload, dict) else None
 
     async def get_cameras(self) -> list[Camera]:
         return parse_cameras(await self._get("/cameras"))

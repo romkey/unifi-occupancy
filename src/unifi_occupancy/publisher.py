@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Iterable, Sequence
-from typing import Protocol
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Any, Protocol
 
 from .config import Config
 from .discovery import attributes_payload, discovery_messages, removal_messages
+from .info import camera_info_payload, service_info_payload
 from .models import DETECTION_KEYS, Camera
 from .state import CameraState
 from .topics import (
@@ -22,7 +23,9 @@ from .topics import (
     attributes_topic,
     detection_topic,
     enabled_topic,
+    info_topic,
     payload_for,
+    service_info_topic,
 )
 
 logger = logging.getLogger(__name__)
@@ -61,6 +64,25 @@ class StatePublisher:
             force=True,
         )
 
+    async def publish_service_info(
+        self,
+        *,
+        meta: Mapping[str, Any] | None = None,
+        console: Mapping[str, Any] | None = None,
+        camera_count: int | None = None,
+    ) -> None:
+        """Publish ``<prefix>/info``: this build, Protect, and the console."""
+        payload = service_info_payload(
+            self._config,
+            meta=meta,
+            console=console,
+            camera_count=camera_count,
+        )
+        await self._send(
+            service_info_topic(self._config.mqtt),
+            json.dumps(payload, sort_keys=True),
+        )
+
     async def announce(self, camera: Camera) -> None:
         """Send HA discovery for a camera we have not announced yet."""
         if not self._config.discovery.enabled or camera.id in self._announced:
@@ -97,6 +119,10 @@ class StatePublisher:
         await self._send(
             attributes_topic(self._config.mqtt, camera),
             json.dumps(attributes_payload(camera), sort_keys=True),
+        )
+        await self._send(
+            info_topic(self._config.mqtt, camera),
+            json.dumps(camera_info_payload(camera), sort_keys=True),
         )
 
     async def publish_all(self, states: Sequence[CameraState]) -> None:
