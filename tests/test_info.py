@@ -6,6 +6,7 @@ from dataclasses import replace
 from conftest import FakeTransport, camera_payload
 from unifi_occupancy import __version__
 from unifi_occupancy.config import Config
+from unifi_occupancy.discovery import device_block
 from unifi_occupancy.info import camera_info_payload, console_info, service_info_payload
 from unifi_occupancy.models import MOTION, PERSON, SMOKE, parse_camera
 from unifi_occupancy.publisher import StatePublisher
@@ -245,3 +246,50 @@ async def test_retracting_a_camera_takes_its_info_entity_with_it(
     await publisher.retract([camera])
 
     assert transport.payload_for(CAMERA_INFO_CONFIG) is None
+
+
+async def test_the_camera_info_entity_shows_the_hardware_not_the_word_camera(
+    config: Config, transport: FakeTransport
+) -> None:
+    """Protect answers `modelKey` with "camera" for every camera."""
+    camera = parse_camera(camera_payload())
+    state = DetectionTracker(hold_seconds=30.0).snapshot(camera, now=1.0)
+
+    await StatePublisher(config, transport).publish_state(state)
+
+    body = json.loads(transport.payload_for(CAMERA_INFO_CONFIG) or "{}")
+    assert body["value_template"] == "{{ value_json.hardware or value_json.model or 'unknown' }}"
+    # The device page has the same problem and the same fix.
+    assert body["device"]["model"] == "UVC G4 Doorbell Pro"
+
+    info = json.loads(transport.payload_for("unifi-occupancy/front_door/info") or "{}")
+    assert info["hardware"] == "UVC G4 Doorbell Pro"
+    assert info["model"] == "camera"
+
+
+def test_an_older_controller_without_a_type_falls_back_to_the_model(config: Config) -> None:
+    """`type` is not guaranteed; the fallback must still name something."""
+    payload = camera_payload()
+    del payload["type"]
+    camera = parse_camera(payload)
+
+    assert device_block(config, camera)["model"] == "camera"
+
+
+def test_a_camera_with_neither_still_names_something(config: Config) -> None:
+    payload = camera_payload()
+    del payload["type"]
+    del payload["modelKey"]
+
+    assert device_block(config, parse_camera(payload))["model"] == "UniFi Protect Camera"
+
+
+async def test_attributes_carry_the_hardware_too(config: Config, transport: FakeTransport) -> None:
+    camera = parse_camera(camera_payload())
+    state = DetectionTracker(hold_seconds=30.0).snapshot(camera, now=1.0)
+
+    await StatePublisher(config, transport).publish_state(state)
+
+    attributes = json.loads(transport.payload_for("unifi-occupancy/front_door/attributes") or "{}")
+    assert attributes["hardware"] == "UVC G4 Doorbell Pro"
+    assert attributes["model"] == "camera"

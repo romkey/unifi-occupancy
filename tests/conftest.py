@@ -50,7 +50,12 @@ def camera_payload(**overrides: Any) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "id": "cam-1",
         "name": "Front Door",
-        "modelKey": "G4 Doorbell Pro",
+        # Protect answers `modelKey` with the kind of thing this is, which is
+        # "camera" for every camera; `type` is the hardware. Spelled the way the
+        # controller really spells it, because a fixture that flatters the code
+        # is how the useless value reached Home Assistant in the first place.
+        "modelKey": "camera",
+        "type": "UVC G4 Doorbell Pro",
         "mac": "AABBCCDDEEFF",
         "firmwareVersion": "4.70.55",
         "state": "CONNECTED",
