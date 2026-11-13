@@ -18,6 +18,7 @@ from .discovery import (
     discovery_messages,
     health_messages,
     removal_messages,
+    service_messages,
 )
 from .health import HealthVerdict
 from .info import camera_info_payload, service_info_payload
@@ -54,6 +55,8 @@ class StatePublisher:
         self._announced: set[str] = set()
         #: Cameras whose stale health topics we have already cleaned up.
         self._health_cleared: set[str] = set()
+        #: Whether the bridge device's own discovery has gone out this process.
+        self._service_announced = False
 
     async def _send(self, topic: str, payload: str | None, *, force: bool = False) -> None:
         if not force and self._published.get(topic, object()) == payload:
@@ -81,6 +84,7 @@ class StatePublisher:
         camera_count: int | None = None,
     ) -> None:
         """Publish ``<prefix>/info``: this build, Protect, and the console."""
+        await self.announce_service()
         payload = service_info_payload(
             self._config,
             meta=meta,
@@ -91,6 +95,19 @@ class StatePublisher:
             service_info_topic(self._config.mqtt),
             json.dumps(payload, sort_keys=True),
         )
+
+    async def announce_service(self) -> None:
+        """Send HA discovery for the bridge device, once per process.
+
+        Ordered before the payload it describes only for tidiness: both topics
+        are retained, so Home Assistant gets the same result either way.
+        """
+        if not self._config.discovery.enabled or self._service_announced:
+            return
+        for message in service_messages(self._config):
+            await self._send(message.topic, json.dumps(message.payload), force=True)
+        self._service_announced = True
+        logger.info("announced the service to Home Assistant")
 
     async def announce(self, camera: Camera) -> None:
         """Send HA discovery for a camera we have not announced yet."""

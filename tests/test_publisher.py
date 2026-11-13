@@ -90,7 +90,7 @@ async def test_discovery_is_sent_once_per_camera(config: Config, transport: Fake
     await publisher.publish_state(snapshot(events=[MOTION]))
 
     still = [t for t in transport.topics if t.startswith("homeassistant/")]
-    assert len(announced) == 8  # 4 detections x (state + enabled)
+    assert len(announced) == 9  # 4 detections x (state + enabled), plus info
     # The two health entities are retracted rather than announced, because the
     # health check is off in this config and may have been on in a previous run.
     assert len(cleared) == 2
