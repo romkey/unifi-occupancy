@@ -77,10 +77,23 @@ async def test_discovery_is_sent_once_per_camera(config: Config, transport: Fake
 
     await publisher.publish_state(snapshot())
     discovery_topics = [t for t in transport.topics if t.startswith("homeassistant/")]
+    announced = [
+        topic
+        for topic, payload, _, _ in transport.messages
+        if topic.startswith("homeassistant/") and payload is not None
+    ]
+    cleared = [
+        topic
+        for topic, payload, _, _ in transport.messages
+        if topic.startswith("homeassistant/") and payload is None
+    ]
     await publisher.publish_state(snapshot(events=[MOTION]))
 
     still = [t for t in transport.topics if t.startswith("homeassistant/")]
-    assert len(discovery_topics) == 8  # 4 detections x (state + enabled)
+    assert len(announced) == 8  # 4 detections x (state + enabled)
+    # The two health entities are retracted rather than announced, because the
+    # health check is off in this config and may have been on in a previous run.
+    assert len(cleared) == 2
     assert still == discovery_topics
 
 

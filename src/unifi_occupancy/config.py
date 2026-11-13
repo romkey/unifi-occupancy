@@ -125,6 +125,66 @@ class MqttConfig:
         return f"{self.topic_prefix}/status"
 
 
+#: The default question put to the vision model. Overridable in full with
+#: ``CAMERA_HEALTH_PROMPT``; see .env.example.
+DEFAULT_HEALTH_PROMPT = (
+    "You are inspecting a single still frame from a fixed security camera to decide "
+    "whether the camera itself is still producing a usable picture. You are not "
+    "judging whether anything interesting is happening in the scene.\n"
+    "\n"
+    "Answer bad if the view is obstructed or blocked (a wall, a vehicle, foliage, a "
+    "cover, tape, a hand), out of focus, blurred or smeared, dirty, fogged by "
+    "condensation or spiderweb, washed out by glare or an infrared reflection off a "
+    "nearby surface, almost entirely black or entirely white, visibly corrupted "
+    "(banding, tearing, a green or magenta cast), or aimed somewhere useless such as "
+    "straight at the sky, the ground or a ceiling.\n"
+    "\n"
+    "Answer good if the frame shows a usable view of whatever it is pointed at, even "
+    "if it is dull, empty, grainy, rainy, snowy or lit only by infrared at night. "
+    "Night-time darkness on its own is not a fault; an image with no discernible "
+    "structure at all is.\n"
+    "\n"
+    'Reply with JSON and nothing else: {"health": "good"} or {"health": "bad", '
+    '"explanation": "<at most 15 words>"}.'
+)
+
+
+@dataclass(frozen=True)
+class HealthConfig:
+    """The optional vision check on each camera's own picture.
+
+    Off unless ``CAMERA_HEALTH_ENABLED`` is set, because switching it on means
+    this process starts reading snapshots and sending them to a model -- which
+    is the one thing the rest of the service is built not to do.
+    """
+
+    enabled: bool = False
+    #: Any OpenAI-compatible ``/chat/completions`` endpoint.
+    base_url: str = "https://api.openai.com/v1"
+    #: Optional: local servers (Ollama, llama.cpp, vLLM) usually need no key.
+    api_key: str | None = None
+    model: str = "gpt-4o-mini"
+    prompt: str = DEFAULT_HEALTH_PROMPT
+    #: How often every camera is checked.
+    interval_minutes: float = 60.0
+    #: Seconds between one camera's check and the next, so a sweep is a trickle
+    #: rather than a burst of simultaneous uploads.
+    stagger_seconds: float = 5.0
+    request_timeout: float = 60.0
+    #: Ask Protect for the full-resolution snapshot rather than a small one.
+    high_quality_snapshot: bool = False
+    #: Explanations are meant to fit in a notification, not to be an essay.
+    max_explanation_chars: int = 200
+
+    @property
+    def interval_seconds(self) -> float:
+        return self.interval_minutes * 60.0
+
+    @property
+    def completions_url(self) -> str:
+        return f"{self.base_url.rstrip('/')}/chat/completions"
+
+
 @dataclass(frozen=True)
 class DiscoveryConfig:
     """Home Assistant MQTT autodiscovery settings."""
@@ -407,6 +467,7 @@ class Config:
     protect: ProtectConfig
     mqtt: MqttConfig
     discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
+    health: HealthConfig = field(default_factory=HealthConfig)
     log_level: str = "INFO"
     #: How long a smart detection stays "on" after the last event that reported it.
     detection_hold_seconds: float = 30.0
@@ -414,6 +475,33 @@ class Config:
     config_file: Path = DEFAULT_CONFIG_FILE
     #: Filled in from :func:`load_report_config`; ``None`` disables the sheets.
     reports: ReportConfig | None = None
+
+
+def _health_config(env: Mapping[str, str]) -> HealthConfig:
+    """The camera health check, which is off unless explicitly switched on."""
+    enabled = _get_bool(env, "CAMERA_HEALTH_ENABLED", False)
+    base_url = _get(env, "CAMERA_HEALTH_API_BASE_URL", "https://api.openai.com/v1") or ""
+    model = _get(env, "CAMERA_HEALTH_MODEL", "gpt-4o-mini") or ""
+    prompt = _get(env, "CAMERA_HEALTH_PROMPT", DEFAULT_HEALTH_PROMPT) or ""
+
+    # A blank model or prompt falls back to the default, as everywhere else
+    # here, so only the endpoint can actually be wrong -- and only when the
+    # feature is on, so half-finished settings never stop the service starting.
+    if enabled and not base_url.startswith(("http://", "https://")):
+        raise ConfigError(f"CAMERA_HEALTH_API_BASE_URL must be an http(s) URL, got {base_url!r}")
+
+    return HealthConfig(
+        enabled=enabled,
+        base_url=base_url,
+        api_key=_get(env, "CAMERA_HEALTH_API_KEY"),
+        model=model,
+        prompt=prompt,
+        interval_minutes=_get_positive_float(env, "CAMERA_HEALTH_INTERVAL_MINUTES", 60.0),
+        stagger_seconds=_get_float(env, "CAMERA_HEALTH_STAGGER_SECONDS", 5.0),
+        request_timeout=_get_positive_float(env, "CAMERA_HEALTH_REQUEST_TIMEOUT", 60.0),
+        high_quality_snapshot=_get_bool(env, "CAMERA_HEALTH_HIGH_QUALITY_SNAPSHOT", False),
+        max_explanation_chars=_get_int(env, "CAMERA_HEALTH_MAX_EXPLANATION_CHARS", 200),
+    )
 
 
 def load_config(env: Mapping[str, str] | None = None) -> Config:
@@ -454,10 +542,13 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         node_id=_get(env, "HA_NODE_ID", "unifi_occupancy") or "unifi_occupancy",
     )
 
+    health = _health_config(env)
+
     return Config(
         protect=protect,
         mqtt=mqtt,
         discovery=discovery,
+        health=health,
         log_level=(_get(env, "LOG_LEVEL", "INFO") or "INFO").upper(),
         detection_hold_seconds=_get_positive_float(env, "DETECTION_HOLD_SECONDS", 30.0),
         config_file=Path(_get(env, "CONFIG_FILE") or DEFAULT_CONFIG_FILE),

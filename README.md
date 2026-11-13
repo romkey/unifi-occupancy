@@ -51,6 +51,7 @@ unifi-occupancy/<camera>/smoke                ON | OFF
 unifi-occupancy/<camera>/smoke_enabled        ON | OFF
 unifi-occupancy/<camera>/attributes           {"camera_name": "Front Door", ...}
 unifi-occupancy/<camera>/info                 {"mac": "...", "firmware": "...", ...}
+unifi-occupancy/<camera>/health               {"health": "good"}   (opt-in)
 ```
 
 `<camera>` is the camera's Protect name, lowercased with non-alphanumerics collapsed to
@@ -115,6 +116,64 @@ Autodiscovery is on by default. Each camera arrives as one HA **device** carryin
 binary sensors — four detections, plus four diagnostic "…Detection Enabled" sensors. Nothing
 needs to be added to `configuration.yaml`. Set `HA_DISCOVERY_ENABLED=false` if you would
 rather wire the topics up by hand.
+
+## Is the camera still looking at anything?
+
+Opt-in, off by default, and the one feature here that reads a picture.
+
+A camera that has been nudged, spidered over, sprayed, rained into or slowly annexed by a
+shrub keeps reporting detections — of the shrub. Nothing in the detection stream says the
+view stopped being worth anything, which is exactly the failure you find out about when you
+go looking for footage you do not have.
+
+So with `CAMERA_HEALTH_ENABLED=true`, once an hour, this takes **one snapshot per camera**
+and asks a vision model a single question: does this camera still see something usable? The
+answer lands on its own topic:
+
+```
+unifi-occupancy/front_door/health   {"health": "good", "model": "gpt-4o-mini", "checked_at": "..."}
+unifi-occupancy/driveway/health     {"health": "bad", "explanation": "lens is fogged over", ...}
+unifi-occupancy/garage/health       {"health": "unknown", "explanation": "camera is not connected", ...}
+```
+
+Three verdicts, and the difference between the last two matters: `bad` is the model saying
+the camera is in trouble, `unknown` is this service saying it could not find out — camera
+offline, snapshot refused, endpoint down, model gibberish. An `unknown` never raises an
+alarm and never hides one.
+
+### What it asks
+
+Any OpenAI-compatible `/chat/completions` endpoint will do: OpenAI, OpenRouter, or a model
+running on your own hardware through Ollama, llama.cpp, vLLM or LM Studio. The API key is
+optional, because local servers do not want one.
+
+The prompt ships in the code and is overridable in full with `CAMERA_HEALTH_PROMPT` — see
+[.env.example](./.env.example) for the text. It asks for `bad` on a view that is obstructed,
+blocked, out of focus, smeared, dirty, fogged, glared out, black, white, corrupted or aimed
+at a ceiling; and for `good` on anything usable, explicitly including night-time infrared,
+rain, snow, grain and sheer boredom — a dark picture at 2am is a working camera, not a
+broken one. Replies are read as JSON when they are JSON and as prose when they are not, so
+small local models that cannot hold a format still get a verdict out.
+
+### Home Assistant
+
+With the check on, each camera's device gains two diagnostic entities: **Camera Health**, a
+sensor reading `good` / `bad` / `unknown`, and **Camera Health Problem**, a `problem` binary
+sensor that is on only for an explicit `bad`. Automate on the second and read the first.
+
+### What it costs, and what it gives up
+
+One image per camera per hour — 24 a day each, a few cents a day against a hosted
+small-vision model, nothing at all against a local one. `CAMERA_HEALTH_INTERVAL_MINUTES`
+turns that dial; `CAMERA_HEALTH_STAGGER_SECONDS` spaces the sweep out so a dozen cameras do
+not all upload at once.
+
+And it gives up the thing the rest of this service is built around: with the check on,
+snapshots do leave the process, to whichever endpoint you configured. That is why it is off
+unless you switch it on, why it needs an API key with snapshot permission to work at all,
+and why the frames are held in memory for one request and never published, logged or
+written to disk. What reaches your broker is still a word and, at worst, a short sentence.
+If that trade is not one you want, do not set the variable and nothing changes.
 
 ## Daily occupancy sheets
 
@@ -331,6 +390,16 @@ groups and the daily sheets are YAML; see [above](#configuration).
 | `HA_DISCOVERY_PREFIX` | `homeassistant` | HA discovery topic prefix |
 | `HA_NODE_ID` | `unifi_occupancy` | Node id used in discovery topics and unique ids |
 | `DETECTION_HOLD_SECONDS` | `30` | How long a detection stays ON after its last event |
+| `CAMERA_HEALTH_ENABLED` | `false` | Hourly vision check on each camera's own picture |
+| `CAMERA_HEALTH_API_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible endpoint |
+| `CAMERA_HEALTH_API_KEY` | unset | Optional; local servers need none |
+| `CAMERA_HEALTH_MODEL` | `gpt-4o-mini` | Model to ask; must be able to see images |
+| `CAMERA_HEALTH_PROMPT` | see [.env.example](./.env.example) | The question put to the model |
+| `CAMERA_HEALTH_INTERVAL_MINUTES` | `60` | How often every camera is checked |
+| `CAMERA_HEALTH_STAGGER_SECONDS` | `5` | Gap between one camera's check and the next |
+| `CAMERA_HEALTH_REQUEST_TIMEOUT` | `60` | Vision request timeout, seconds |
+| `CAMERA_HEALTH_HIGH_QUALITY_SNAPSHOT` | `false` | Full-resolution snapshots |
+| `CAMERA_HEALTH_MAX_EXPLANATION_CHARS` | `200` | Trim length for a `bad` explanation |
 | `CONFIG_FILE` | `/config/config.yaml` | Groups, periods and sheets. No file, no sheets |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 
@@ -370,6 +439,7 @@ mosquitto_sub -h localhost -t 'unifi-occupancy/#' -v
 | `protect.py` | Read-only Protect HTTP + websocket client |
 | `discovery.py` | Home Assistant discovery payloads |
 | `info.py` | The `info` metadata payloads for the service and each camera |
+| `health.py` | The optional vision check: snapshot, ask, verdict, schedule |
 | `publisher.py` | Topic layout, change detection, retraction |
 | `recorder.py` | Published state → detection edges worth keeping |
 | `store.py` | The SQLite detection history and per-day summaries |
@@ -382,14 +452,19 @@ controller and no broker.
 
 ## Privacy notes
 
-- Only `/meta/info`, `/nvrs` and `/cameras` are read, plus the event subscription. Video,
-  snapshot and stream endpoints are never called.
+- Only `/meta/info`, `/nvrs` and `/cameras` are read, plus the event subscription. Video and
+  stream endpoints are never called.
+- The snapshot endpoint is called only with `CAMERA_HEALTH_ENABLED=true`, and only for the
+  health check: one frame per camera per interval, sent to the endpoint you configured,
+  held in memory for the length of that one request, and never published to MQTT, written
+  to disk or logged. Leave the variable unset and no snapshot is ever taken.
 - Published attributes are limited to camera id, name, model, connection state, last motion
   time and which detections the hardware supports.
 - The `info` topics add the console's name, type, version and uptime, and each camera's MAC,
   firmware and hardware model. Both are allowlists; nothing is forwarded from Protect that
   is not named in `info.py`.
 - The API key exists only in the process environment. It is not logged and not published.
+  Nor is the vision endpoint's key, if you set one.
 - Nothing subscribes to MQTT; this process only writes.
 - The occupancy sheets record camera names, detection kinds and timestamps. Nothing else is
   stored, and nothing in `/var/www/html` is served by this process — it only writes the

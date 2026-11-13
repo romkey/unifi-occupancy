@@ -13,7 +13,13 @@ from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, Protocol
 
 from .config import Config
-from .discovery import attributes_payload, discovery_messages, removal_messages
+from .discovery import (
+    attributes_payload,
+    discovery_messages,
+    health_messages,
+    removal_messages,
+)
+from .health import HealthVerdict
 from .info import camera_info_payload, service_info_payload
 from .models import DETECTION_KEYS, Camera
 from .state import CameraState
@@ -23,6 +29,7 @@ from .topics import (
     attributes_topic,
     detection_topic,
     enabled_topic,
+    health_topic,
     info_topic,
     payload_for,
     service_info_topic,
@@ -45,6 +52,8 @@ class StatePublisher:
         self._transport = transport
         self._published: dict[str, str | None] = {}
         self._announced: set[str] = set()
+        #: Cameras whose stale health topics we have already cleaned up.
+        self._health_cleared: set[str] = set()
 
     async def _send(self, topic: str, payload: str | None, *, force: bool = False) -> None:
         if not force and self._published.get(topic, object()) == payload:
@@ -92,6 +101,22 @@ class StatePublisher:
         self._announced.add(camera.id)
         logger.info("announced camera %s (%s) to Home Assistant", camera.name, camera.id)
 
+    async def _clear_disabled_health(self, camera: Camera) -> None:
+        """Take down health topics left behind by a previous run.
+
+        Switching ``CAMERA_HEALTH_ENABLED`` back off would otherwise leave a
+        retained verdict -- possibly a ``bad`` one -- and its discovery configs
+        on the broker for good, so the camera would look permanently broken by a
+        check that is no longer running. Done once per camera per process.
+        """
+        if self._config.health.enabled or camera.id in self._health_cleared:
+            return
+        self._health_cleared.add(camera.id)
+        if self._config.discovery.enabled:
+            for message in health_messages(self._config, camera):
+                await self._send(message.topic, None, force=True)
+        await self._send(health_topic(self._config.mqtt, camera), None, force=True)
+
     async def retract(self, cameras: Iterable[Camera]) -> None:
         """Remove cameras from HA and forget their published state."""
         for camera in cameras:
@@ -104,9 +129,11 @@ class StatePublisher:
             for topic in (
                 info_topic(self._config.mqtt, camera),
                 attributes_topic(self._config.mqtt, camera),
+                health_topic(self._config.mqtt, camera),
             ):
                 await self._send(topic, None, force=True)
             self._announced.discard(camera.id)
+            self._health_cleared.discard(camera.id)
             prefix = f"{self._config.mqtt.topic_prefix}/{camera.slug}/"
             for topic in [key for key in self._published if key.startswith(prefix)]:
                 del self._published[topic]
@@ -115,6 +142,7 @@ class StatePublisher:
     async def publish_state(self, state: CameraState) -> None:
         camera = state.camera
         await self.announce(camera)
+        await self._clear_disabled_health(camera)
         for key in DETECTION_KEYS:
             await self._send(
                 detection_topic(self._config.mqtt, camera, key),
@@ -131,6 +159,19 @@ class StatePublisher:
         await self._send(
             info_topic(self._config.mqtt, camera),
             json.dumps(camera_info_payload(camera), sort_keys=True),
+        )
+
+    async def publish_health(self, camera: Camera, verdict: HealthVerdict) -> None:
+        """Publish one camera's health verdict.
+
+        Forced rather than change-suppressed: an hourly "still good" is how a
+        consumer tells a healthy camera from one this process stopped checking,
+        and ``checked_at`` would defeat the suppression anyway.
+        """
+        await self._send(
+            health_topic(self._config.mqtt, camera),
+            json.dumps(verdict.payload(), sort_keys=True),
+            force=True,
         )
 
     async def publish_all(self, states: Sequence[CameraState]) -> None:

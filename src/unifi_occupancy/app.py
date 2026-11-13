@@ -13,6 +13,7 @@ from typing import Any
 import aiomqtt
 
 from .config import Config
+from .health import CameraHealthMonitor, VisionJudge
 from .models import Camera, DetectionEvent
 from .protect import ProtectAuthError, ProtectClient, ProtectError
 from .publisher import AiomqttTransport, StatePublisher
@@ -216,6 +217,28 @@ async def _serve(
         await publisher.publish_service_info(meta=meta, console=console)
 
         tasks = [asyncio.create_task(service.poll_forever(), name="poll")]
+        judge: VisionJudge | None = None
+        if config.health.enabled:
+            judge = VisionJudge(config.health)
+            monitor = CameraHealthMonitor(
+                config.health,
+                protect,
+                publisher,
+                judge,
+                is_current=lambda camera_id: camera_id in service.cameras,
+            )
+            tasks.append(
+                asyncio.create_task(
+                    monitor.run_forever(lambda: list(service.cameras.values())),
+                    name="health",
+                )
+            )
+            logger.info(
+                "checking camera health every %g minute(s) with %s at %s",
+                config.health.interval_minutes,
+                config.health.model,
+                config.health.base_url,
+            )
         if config.protect.use_websocket:
             tasks.append(asyncio.create_task(service.watch_events_forever(), name="events"))
         if store is not None and config.reports is not None:
@@ -236,5 +259,8 @@ async def _serve(
                 task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await asyncio.gather(*tasks, return_exceptions=True)
+            if judge is not None:
+                with contextlib.suppress(Exception):
+                    await judge.aclose()
             with contextlib.suppress(Exception):
                 await publisher.publish_availability(False)

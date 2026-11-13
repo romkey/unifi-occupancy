@@ -90,9 +90,16 @@ def service_info_payload(
             "websocket": config.protect.use_websocket,
             "ha_discovery": config.discovery.enabled,
             "occupancy_sheets": config.reports is not None and config.reports.enabled,
+            "camera_health": config.health.enabled,
         },
         "detections": list(DETECTION_KEYS),
     }
+    if config.health.enabled:
+        payload["camera_health"] = {
+            "model": config.health.model,
+            "endpoint": config.health.base_url,
+            "interval_minutes": config.health.interval_minutes,
+        }
     if camera_count is not None:
         payload["cameras"] = camera_count
     return payload
