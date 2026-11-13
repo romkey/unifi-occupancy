@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "unifi-occupancy"
-version = "0.7.0"
+version = "0.7.1"
 description = "Publish UniFi Protect detection state to MQTT without exposing camera video"
 readme = "README.md"
 license = { text = "MIT" }
