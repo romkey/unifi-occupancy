@@ -23,6 +23,7 @@ from unifi_occupancy.health import (
 )
 from unifi_occupancy.models import parse_camera
 from unifi_occupancy.publisher import StatePublisher
+from unifi_occupancy.state import DetectionTracker
 
 HEALTH = HealthConfig(
     enabled=True,
@@ -415,3 +416,140 @@ async def test_retracting_a_camera_clears_its_retained_verdict(
     await publisher.retract([CAMERA])
 
     assert transport.payload_for("unifi-occupancy/front_door/health") is None
+
+
+# --------------------------------------------------------------------------- #
+# Prose that says the opposite of the words in it
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "The view is not blocked; the image looks fine.",
+        "No obstruction, no blur. Nothing bad here.",
+        "The lens is clear of obstructions.",
+        "This is not a bad picture.",
+    ],
+)
+def test_a_negated_problem_word_is_not_a_problem(text: str) -> None:
+    assert parse_verdict(text)[0] != BAD
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "The camera is blocked by a van.",
+        "Badly out of focus.",
+        "The view is obscured by foliage.",
+        "The image is unusable.",
+    ],
+)
+def test_prose_that_really_does_report_a_fault(text: str) -> None:
+    assert parse_verdict(text)[0] == BAD
+
+
+def test_prose_that_says_it_is_fine_reads_as_good() -> None:
+    assert parse_verdict("The picture looks good to me.")[0] == GOOD
+
+
+# --------------------------------------------------------------------------- #
+# A camera that disappears mid-sweep
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_camera_removed_during_a_sweep_is_not_published() -> None:
+    sink = FakeSink()
+    snapshots = FakeSnapshots()
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monitor = CameraHealthMonitor(
+        HEALTH,
+        snapshots,
+        sink,
+        FakeJudge(HealthVerdict(GOOD)),
+        sleep=no_sleep,
+        is_current=lambda _camera_id: False,
+    )
+
+    await monitor.sweep([CAMERA])
+
+    # Its retained topics have already been cleared by the retraction; putting
+    # a verdict back would leave an orphan nothing clears again.
+    assert sink.published == []
+    assert snapshots.calls == []
+
+
+async def test_a_camera_still_present_is_published() -> None:
+    sink = FakeSink()
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monitor = CameraHealthMonitor(
+        HEALTH,
+        FakeSnapshots(),
+        sink,
+        FakeJudge(HealthVerdict(GOOD)),
+        sleep=no_sleep,
+        is_current=lambda camera_id: camera_id == "cam-1",
+    )
+
+    await monitor.sweep([CAMERA])
+
+    assert [name for name, _ in sink.published] == ["Front Door"]
+
+
+# --------------------------------------------------------------------------- #
+# Turning the check back off
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_disabled_check_clears_what_an_enabled_one_left(
+    config: Config, transport: FakeTransport
+) -> None:
+    state = DetectionTracker(hold_seconds=30.0).snapshot(CAMERA, now=1.0)
+    publisher = StatePublisher(config, transport)
+
+    await publisher.publish_state(state)
+
+    # The verdict and both discovery configs are emptied, so a stale "bad" from
+    # a run with the check switched on cannot sit on the broker for ever.
+    assert transport.payload_for("unifi-occupancy/front_door/health") is None
+    assert (
+        transport.payload_for("homeassistant/sensor/unifi_occupancy_front_door/health/config")
+        is None
+    )
+    assert (
+        transport.payload_for(
+            "homeassistant/binary_sensor/unifi_occupancy_front_door/health_problem/config"
+        )
+        is None
+    )
+
+
+async def test_the_cleanup_happens_once_per_camera(
+    config: Config, transport: FakeTransport
+) -> None:
+    state = DetectionTracker(hold_seconds=30.0).snapshot(CAMERA, now=1.0)
+    publisher = StatePublisher(config, transport)
+
+    await publisher.publish_state(state)
+    first = len([t for t in transport.topics if "health" in t])
+    await publisher.publish_state(state)
+
+    assert len([t for t in transport.topics if "health" in t]) == first
+
+
+async def test_an_enabled_check_announces_rather_than_clears(
+    config: Config, transport: FakeTransport
+) -> None:
+    enabled = replace(config, health=HEALTH)
+    state = DetectionTracker(hold_seconds=30.0).snapshot(CAMERA, now=1.0)
+
+    await StatePublisher(enabled, transport).publish_state(state)
+
+    payload = transport.payload_for("homeassistant/sensor/unifi_occupancy_front_door/health/config")
+    assert payload is not None

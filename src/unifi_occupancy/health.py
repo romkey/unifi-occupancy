@@ -19,6 +19,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -91,6 +92,33 @@ def _json_object(text: str) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+#: Words that, un-negated, mean the model is reporting a fault, and words that
+#: mean it is not. Matched on whole words: "badly" is a problem, "badger" is not.
+_PROBLEM_WORDS = re.compile(r"\b(?:bad|badly|obscur\w*|obstruct\w*|blocked|broken|unusable)\b")
+_HEALTHY_WORDS = re.compile(r"\b(?:good|healthy|fine|usable|normal|ok|okay)\b")
+#: A negation anywhere in the clause before a word flips its sense: "not
+#: blocked" and "no obstruction" must never read as a fault.
+_NEGATION = re.compile(
+    r"\b(?:not|no|never|nothing|none|isn't|aren't|wasn't|doesn't|don't|without|free|clear)\b"
+)
+
+
+def _mentions(words: re.Pattern[str], text: str) -> bool:
+    """True when ``text`` uses one of ``words`` and does not negate it.
+
+    A model that answers in prose rather than JSON is being read generously, so
+    the reading has to be careful: "the view is not blocked" contains the word
+    "blocked" and means the opposite of it. Anything ambiguous falls through to
+    ``unknown``, which raises no alarm.
+    """
+    for match in words.finditer(text):
+        clause = text[: match.start()].rsplit(".", 1)[-1]
+        if _NEGATION.search(clause[-60:]):
+            continue
+        return True
+    return False
+
+
 def parse_verdict(text: str, *, limit: int = 200) -> tuple[str, str | None]:
     """Read a status and an explanation out of whatever the model said.
 
@@ -113,8 +141,10 @@ def parse_verdict(text: str, *, limit: int = 200) -> tuple[str, str | None]:
     lowered = text.strip().lower()
     if lowered.startswith(GOOD) or lowered in {"ok", "healthy"}:
         return GOOD, None
-    if BAD in lowered or "obscur" in lowered or "blocked" in lowered:
+    if _mentions(_PROBLEM_WORDS, lowered):
         return BAD, _tidy(text, limit)
+    if _mentions(_HEALTHY_WORDS, lowered):
+        return GOOD, None
     return UNKNOWN, _tidy(f"could not read the model's reply: {text}", limit)
 
 
@@ -265,6 +295,7 @@ class CameraHealthMonitor:
         *,
         sleep: Callable[[float], Any] = asyncio.sleep,
         clock: Callable[[], float] = time.monotonic,
+        is_current: Callable[[str], bool] | None = None,
     ) -> None:
         self._config = config
         self._snapshots = snapshots
@@ -272,6 +303,18 @@ class CameraHealthMonitor:
         self._judge = judge
         self._sleep = sleep
         self._clock = clock
+        self._is_current = is_current
+
+    def _still_there(self, camera: Camera) -> bool:
+        """Whether the camera is still in the inventory.
+
+        A sweep takes minutes -- a snapshot, a model, a stagger gap per camera --
+        and the poll loop runs the whole time. A camera removed from Protect
+        halfway through has already had its retained topics cleared, so
+        publishing a verdict for it afterwards would put an orphan back on the
+        broker that nothing will ever clear again.
+        """
+        return self._is_current is None or self._is_current(camera.id)
 
     async def check(self, camera: Camera) -> HealthVerdict:
         """One camera: snapshot, ask, verdict. Never raises."""
@@ -321,7 +364,13 @@ class CameraHealthMonitor:
         for index, camera in enumerate(cameras):
             if index and self._config.stagger_seconds > 0:
                 await self._sleep(self._config.stagger_seconds)
+            if not self._still_there(camera):
+                logger.debug("%s went away before its health check", camera.name)
+                continue
             verdict = await self.check(camera)
+            if not self._still_there(camera):
+                logger.debug("%s went away during its health check", camera.name)
+                continue
             verdicts.append(verdict)
             await self._sink.publish_health(camera, verdict)
         return verdicts

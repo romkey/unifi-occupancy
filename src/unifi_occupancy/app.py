@@ -220,7 +220,13 @@ async def _serve(
         judge: VisionJudge | None = None
         if config.health.enabled:
             judge = VisionJudge(config.health)
-            monitor = CameraHealthMonitor(config.health, protect, publisher, judge)
+            monitor = CameraHealthMonitor(
+                config.health,
+                protect,
+                publisher,
+                judge,
+                is_current=lambda camera_id: camera_id in service.cameras,
+            )
             tasks.append(
                 asyncio.create_task(
                     monitor.run_forever(lambda: list(service.cameras.values())),

@@ -153,8 +153,17 @@ def discovery_messages(config: Config, camera: Camera) -> list[DiscoveryMessage]
 
 
 def removal_messages(config: Config, camera: Camera) -> list[DiscoveryMessage]:
-    """Empty-payload messages that retract a camera's entities from HA."""
-    return [DiscoveryMessage(message.topic, None) for message in discovery_messages(config, camera)]
+    """Empty-payload messages that retract a camera's entities from HA.
+
+    The health entities are retracted whether or not the check is switched on:
+    emptying a topic that was never published costs one message, while leaving a
+    retained config behind after someone switches the check off leaves Home
+    Assistant holding an entity nothing will ever update again.
+    """
+    messages = list(discovery_messages(config, camera))
+    if not config.health.enabled:
+        messages.extend(health_messages(config, camera))
+    return [DiscoveryMessage(message.topic, None) for message in messages]
 
 
 def attributes_payload(camera: Camera) -> dict[str, Any]:
