@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from unifi_occupancy.models import MOTION
 from unifi_occupancy.store import EventStore, Summary
 
 T0 = datetime(2026, 11, 1, 12, 0, tzinfo=UTC)
@@ -122,3 +123,35 @@ def test_span_is_none_until_something_happens(store: EventStore) -> None:
 
     span = store.span()
     assert span == (T0, T0 + timedelta(hours=3))
+
+
+def test_the_roster_survives_a_rename(store: EventStore) -> None:
+    moment = datetime(2026, 10, 20, 12, 0, tzinfo=UTC)
+    store.record_camera("cam-1", "Front Door", moment)
+    store.record_camera("cam-1", "Front Porch", moment + timedelta(minutes=1))
+
+    assert store.roster() == [("cam-1", "Front Porch")]
+
+
+def test_the_roster_is_sorted_by_name_regardless_of_case(store: EventStore) -> None:
+    moment = datetime(2026, 10, 20, 12, 0, tzinfo=UTC)
+    store.record_camera("cam-2", "driveway", moment)
+    store.record_camera("cam-1", "Front Door", moment)
+
+    assert [name for _, name in store.roster()] == ["driveway", "Front Door"]
+
+
+def test_forgetting_a_camera_keeps_its_events(store: EventStore) -> None:
+    moment = datetime(2026, 10, 20, 12, 0, tzinfo=UTC)
+    store.record_camera("cam-1", "Front Door", moment)
+    store.start_event("cam-1", "Front Door", MOTION, moment)
+
+    store.forget_cameras(["cam-1"])
+
+    assert store.roster() == []
+    assert len(store.events_between(moment - timedelta(hours=1), moment + timedelta(hours=1))) == 1
+
+
+def test_forgetting_nothing_is_allowed(store: EventStore) -> None:
+    store.forget_cameras([])
+    assert store.roster() == []

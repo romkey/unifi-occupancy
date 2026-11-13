@@ -734,3 +734,67 @@ def test_the_day_written_out_tells_its_sheet_how_long_it_was(
     html = page.read_text(encoding="utf-8")
     assert 'data-seconds="90000"' in html
     assert 'data-shifts="[[0.080000,-3600]]"' in html
+
+
+def test_a_quiet_camera_is_still_listed(store: EventStore, reports: ReportConfig) -> None:
+    """Nothing happening is a result, not a reason to leave a camera off."""
+    _, sections, _, _ = SheetWriter(
+        store, reports, cameras=lambda: CAMERAS, clock=lambda: NOON.astimezone(UTC)
+    )._build(DAY)
+
+    assert [section.name for section in sections] == ["Front of house", "Side Gate"]
+    assert [row.label for row in sections[0].rows] == ["All cameras", "Front Door", "Driveway"]
+    assert all(
+        track.events == 0 for section in sections for row in section.rows for track in row.tracks
+    )
+
+
+def test_the_stored_roster_carries_quiet_cameras_without_a_controller(
+    store: EventStore, reports: ReportConfig
+) -> None:
+    """A rebuild has no live camera list, and the event log knows only the noisy ones."""
+    for camera in CAMERAS:
+        store.record_camera(camera.id, camera.name, NOON.astimezone(UTC))
+
+    # No `cameras` callable at all: this is what `--rebuild-sheets` constructs.
+    _, sections, _, _ = SheetWriter(store, reports, clock=lambda: NOON.astimezone(UTC))._build(DAY)
+
+    assert [section.name for section in sections] == ["Front of house", "Side Gate"]
+    assert [row.label for row in sections[0].rows] == ["All cameras", "Front Door", "Driveway"]
+
+
+def test_a_camera_removed_from_protect_leaves_the_roster(
+    store: EventStore, reports: ReportConfig
+) -> None:
+    for camera in CAMERAS:
+        store.record_camera(camera.id, camera.name, NOON.astimezone(UTC))
+    store.forget_cameras(["cam-3"])
+
+    _, sections, _, _ = SheetWriter(store, reports, clock=lambda: NOON.astimezone(UTC))._build(DAY)
+
+    assert [section.name for section in sections] == ["Front of house"]
+
+
+def test_a_removed_camera_keeps_its_place_on_a_day_it_was_there(
+    store: EventStore, reports: ReportConfig
+) -> None:
+    """Dropping it from the roster must not rewrite the history it is in."""
+    record(store, Camera(id="cam-9", name="Old Shed"), MOTION, at(9), 30)
+    store.record_camera("cam-9", "Old Shed", NOON.astimezone(UTC))
+    store.forget_cameras(["cam-9"])
+
+    _, sections, _, _ = SheetWriter(store, reports, clock=lambda: NOON.astimezone(UTC))._build(DAY)
+
+    assert "Old Shed" in [section.name for section in sections]
+
+
+def test_the_live_list_wins_over_a_stale_stored_name(
+    store: EventStore, reports: ReportConfig
+) -> None:
+    store.record_camera("cam-3", "Side Gate (old)", NOON.astimezone(UTC))
+
+    _, sections, _, _ = SheetWriter(
+        store, reports, cameras=lambda: CAMERAS, clock=lambda: NOON.astimezone(UTC)
+    )._build(DAY)
+
+    assert [section.name for section in sections] == ["Front of house", "Side Gate"]

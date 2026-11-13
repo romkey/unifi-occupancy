@@ -100,6 +100,9 @@ def test_a_failing_store_does_not_propagate(caplog: pytest.LogCaptureFixture) ->
         def start_event(self, *args: object, **kwargs: object) -> None:
             raise OSError("disk full")
 
+        def record_camera(self, *args: object, **kwargs: object) -> None:
+            raise OSError("disk full")
+
     recorder = EventRecorder(Broken(), clock=Clock())  # type: ignore[arg-type]
 
     recorder.observe(state(motion=True))
@@ -107,3 +110,6 @@ def test_a_failing_store_does_not_propagate(caplog: pytest.LogCaptureFixture) ->
 
     assert "could not record detection history" in caplog.text
     assert caplog.text.count("could not record detection history") == 1
+    # The roster and the event log are complained about once each: neither
+    # failing is allowed to swallow the other's one warning.
+    assert caplog.text.count("could not record the camera roster") == 1

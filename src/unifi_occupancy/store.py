@@ -34,6 +34,12 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS events_started_at ON events (started_at);
 CREATE INDEX IF NOT EXISTS events_open ON events (camera_id, kind) WHERE ended_at IS NULL;
 
+CREATE TABLE IF NOT EXISTS cameras (
+    camera_id   TEXT PRIMARY KEY,
+    camera_name TEXT NOT NULL,
+    last_seen   REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS day_summaries (
     day        TEXT    NOT NULL,
     group_key  TEXT    NOT NULL,
@@ -124,6 +130,33 @@ class EventStore:
             (camera_id, camera_name, kind, _epoch(at)),
         )
 
+    def record_camera(self, camera_id: str, camera_name: str, at: datetime) -> None:
+        """Note that a camera exists, whether or not it has ever fired.
+
+        The sheets are built from the event log, which knows only about cameras
+        something happened to. A camera that has never tripped would otherwise
+        be missing from the page entirely, and a rebuild done without a live
+        controller has no other way to learn it was there at all.
+        """
+        self._db.execute(
+            """
+            INSERT INTO cameras (camera_id, camera_name, last_seen) VALUES (?, ?, ?)
+            ON CONFLICT (camera_id) DO UPDATE SET camera_name = excluded.camera_name,
+                                                  last_seen = excluded.last_seen
+            """,
+            (camera_id, camera_name, _epoch(at)),
+        )
+
+    def forget_cameras(self, camera_ids: Iterable[str]) -> None:
+        """Drop cameras that have gone away from the roster.
+
+        Their events stay: a camera removed last week still belongs on last
+        week's sheets. It just stops being listed as one that is there now.
+        """
+        ids = [(camera_id,) for camera_id in camera_ids]
+        if ids:
+            self._db.executemany("DELETE FROM cameras WHERE camera_id = ?", ids)
+
     def end_event(self, camera_id: str, kind: str, at: datetime) -> None:
         """Close the open event of this kind, if there is one."""
         self._db.execute(
@@ -208,6 +241,13 @@ class EventStore:
             )
             for row in rows
         ]
+
+    def roster(self) -> list[tuple[str, str]]:
+        """``(camera id, name)`` for every camera known to be there, by name."""
+        rows = self._db.execute(
+            "SELECT camera_id, camera_name FROM cameras ORDER BY camera_name COLLATE NOCASE"
+        ).fetchall()
+        return [(str(row["camera_id"]), str(row["camera_name"])) for row in rows]
 
     def span(self) -> tuple[datetime, datetime] | None:
         """Oldest and newest event start, or ``None`` when there are no events."""

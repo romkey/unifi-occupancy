@@ -148,12 +148,18 @@ class SheetWriter:
     # -- grouping ---------------------------------------------------------
 
     def _roster(self, events: Sequence[StoredEvent]) -> _Roster:
-        """Camera id -> display name, from the live inventory and the history.
+        """Camera id -> display name, from the history, the store and the live list.
 
-        Both are needed: a camera added an hour ago has no events yet, and a
-        camera removed last week still has a day's worth.
+        All three are needed. The history alone lists only cameras something
+        happened to, so a quiet camera would never appear on the page -- which
+        is the whole point of a sheet that says a door was never opened. The
+        stored roster covers the rest: a rebuild run with no controller to ask,
+        and the window after a restart before the first poll has landed. The
+        live list is still the last word, because it is the only one of the
+        three that is current.
         """
         roster: _Roster = {event.camera_id: event.camera_name for event in events}
+        roster.update(dict(self._store.roster()))
         for camera in self._cameras():
             roster[camera.id] = camera.name
         return roster
