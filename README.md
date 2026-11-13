@@ -69,7 +69,7 @@ features are switched on, and how many cameras it can see.
 ```json
 {
   "service": "unifi-occupancy",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "protect": {
     "host": "192.168.1.1",
     "port": 443,
