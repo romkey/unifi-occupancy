@@ -106,6 +106,7 @@ class StatePublisher:
             for topic in (
                 info_topic(self._config.mqtt, camera),
                 attributes_topic(self._config.mqtt, camera),
+                health_topic(self._config.mqtt, camera),
             ):
                 await self._send(topic, None, force=True)
             self._announced.discard(camera.id)

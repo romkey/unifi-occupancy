@@ -404,3 +404,14 @@ def test_health_entities_appear_when_the_check_is_on(config: Config) -> None:
     assert verdict["value_template"] == "{{ value_json.health }}"
     assert problem["device_class"] == "problem"
     assert "bad" in problem["value_template"]
+
+
+async def test_retracting_a_camera_clears_its_retained_verdict(
+    config: Config, transport: FakeTransport
+) -> None:
+    publisher = StatePublisher(config, transport)
+    await publisher.publish_health(CAMERA, HealthVerdict(BAD, explanation="covered"))
+
+    await publisher.retract([CAMERA])
+
+    assert transport.payload_for("unifi-occupancy/front_door/health") is None
