@@ -44,8 +44,13 @@ USER occupancy
 # that ownership; a *bind* mount keeps the host's, so chown those to uid 10001.
 VOLUME ["/var/www/html", "/var/lib/unifi-occupancy"]
 
-# The service holds no listening socket; liveness is "the process is alive and
-# the event loop is not wedged".
+# Documentation only, and only relevant with METRICS_ENABLED=true: nothing
+# listens unless the Prometheus endpoint is switched on.
+EXPOSE 9833
+
+# Liveness is "the process is alive and the event loop is not wedged". It is
+# deliberately not a request to the metrics endpoint: that endpoint is off by
+# default, and a health check cannot hold the token.
 HEALTHCHECK --interval=60s --timeout=10s --start-period=20s --retries=3 \
     CMD python -c "import unifi_occupancy" || exit 1
 

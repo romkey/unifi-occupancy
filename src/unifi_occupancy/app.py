@@ -13,7 +13,9 @@ from typing import Any
 import aiomqtt
 
 from .config import Config
+from .exporter import MetricsServer
 from .health import CameraHealthMonitor, VisionJudge
+from .metrics import OUTCOME_AUTH_ERROR, OUTCOME_ERROR, OUTCOME_SUCCESS, Metrics, default_metrics
 from .models import Camera, DetectionEvent
 from .protect import ProtectAuthError, ProtectClient, ProtectError
 from .publisher import AiomqttTransport, StatePublisher
@@ -61,6 +63,7 @@ class OccupancyService:
         recorder: EventRecorder | None = None,
         meta: Mapping[str, Any] | None = None,
         console: Mapping[str, Any] | None = None,
+        metrics: Metrics | None = None,
     ) -> None:
         self._config = config
         self._protect = protect
@@ -69,6 +72,7 @@ class OccupancyService:
         self._recorder = recorder
         self._meta = meta
         self._console = console
+        self._metrics = metrics or default_metrics()
         self._tracker = DetectionTracker(hold_seconds=config.detection_hold_seconds)
         self._cameras: dict[str, Camera] = {}
         self._lock = asyncio.Lock()
@@ -88,7 +92,9 @@ class OccupancyService:
                 if self._recorder is not None:
                     self._recorder.forget(frozenset(camera.id for camera in gone))
                 await self._publisher.retract(gone)
+                self._metrics.forget_cameras(camera.slug for camera in gone)
             self._cameras = seen
+            self._metrics.observe_cameras(cameras)
             await self._publish_locked(cameras)
             await self._publisher.publish_service_info(
                 meta=self._meta,
@@ -102,12 +108,14 @@ class OccupancyService:
             state = self._tracker.snapshot(camera, now)
             if self._recorder is not None:
                 self._recorder.observe(state)
+            self._metrics.observe_state(state, now)
             await self._publisher.publish_state(state)
 
     async def handle_events(self, events: AsyncIterator[DetectionEvent]) -> None:
         """Apply events as they arrive and republish just the affected camera."""
         async for event in events:
             async with self._lock:
+                self._metrics.record_event(event.keys, start=event.start)
                 self._tracker.apply(event, self._clock())
                 camera = self._cameras.get(event.camera_id)
                 if camera is None:
@@ -117,27 +125,48 @@ class OccupancyService:
 
     async def poll_forever(self) -> None:
         while True:
+            started = self._clock()
+            self._metrics.start_job("poll")
             try:
                 await self.refresh()
+            except asyncio.CancelledError:
+                self._metrics.job_in_progress.set(0, job="poll")
+                raise
             except ProtectAuthError:
+                self._metrics.protect_up.set(0)
+                self._metrics.finish_job("poll", OUTCOME_AUTH_ERROR, self._since(started))
                 raise
             except ProtectError as exc:
+                self._metrics.protect_up.set(0)
+                self._metrics.finish_job("poll", OUTCOME_ERROR, self._since(started))
                 logger.warning("poll failed: %s", exc)
+            else:
+                self._metrics.protect_up.set(1)
+                self._metrics.finish_job("poll", OUTCOME_SUCCESS, self._since(started))
             await asyncio.sleep(self._config.protect.poll_interval)
+
+    def _since(self, started: float) -> float:
+        return max(0.0, self._clock() - started)
 
     async def watch_events_forever(self) -> None:
         """Follow the event websocket, reconnecting with exponential backoff."""
         backoff = MIN_BACKOFF
         while True:
+            started = self._clock()
+            self._metrics.start_job("events")
             try:
                 await self.handle_events(self._protect.events())
                 logger.info("Protect event stream closed; reconnecting")
+                self._metrics.finish_job("events", OUTCOME_SUCCESS, self._since(started))
                 backoff = MIN_BACKOFF
             except ProtectAuthError:
+                self._metrics.finish_job("events", OUTCOME_AUTH_ERROR, self._since(started))
                 raise
             except asyncio.CancelledError:
+                self._metrics.job_in_progress.set(0, job="events")
                 raise
             except Exception as exc:  # noqa: BLE001 - any transport error is retryable
+                self._metrics.finish_job("events", OUTCOME_ERROR, self._since(started))
                 logger.warning("event stream error: %s", exc)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, MAX_BACKOFF)
@@ -165,14 +194,17 @@ def _open_store(config: Config) -> EventStore | None:
 
 async def run(config: Config) -> None:
     """Connect everything up and run until cancelled."""
-    async with ProtectClient(config.protect) as protect:
+    metrics = default_metrics()
+    metrics.describe_config(config)
+    async with ProtectClient(config.protect, metrics=metrics) as protect:
         meta = await protect.get_meta()
         logger.info("connected to UniFi Protect %s", meta.get("applicationVersion", "(unknown)"))
         console = await _console_info(protect)
+        metrics.describe_protect(host=config.protect.host, meta=meta, console=console)
 
         store = _open_store(config)
         try:
-            await _serve(config, protect, store, meta=meta, console=console)
+            await _serve(config, protect, store, meta=meta, console=console, metrics=metrics)
         finally:
             if store is not None:
                 store.close()
@@ -200,11 +232,13 @@ async def _serve(
     *,
     meta: Mapping[str, Any] | None = None,
     console: Mapping[str, Any] | None = None,
+    metrics: Metrics | None = None,
 ) -> None:
-    recorder = EventRecorder(store) if store is not None else None
+    metrics = metrics or default_metrics()
+    recorder = EventRecorder(store, metrics=metrics) if store is not None else None
 
     async with mqtt_client(config) as client:
-        publisher = StatePublisher(config, AiomqttTransport(client))
+        publisher = StatePublisher(config, AiomqttTransport(client), metrics=metrics)
         await publisher.publish_availability(True)
         service = OccupancyService(
             config,
@@ -213,10 +247,16 @@ async def _serve(
             recorder=recorder,
             meta=meta,
             console=console,
+            metrics=metrics,
         )
         await publisher.publish_service_info(meta=meta, console=console)
 
         tasks = [asyncio.create_task(service.poll_forever(), name="poll")]
+        exporter: MetricsServer | None = None
+        if config.metrics.enabled:
+            exporter = MetricsServer(config.metrics, metrics)
+            await exporter.start()
+            tasks.append(asyncio.create_task(exporter.serve_forever(), name="metrics"))
         judge: VisionJudge | None = None
         if config.health.enabled:
             judge = VisionJudge(config.health)
@@ -226,6 +266,7 @@ async def _serve(
                 publisher,
                 judge,
                 is_current=lambda camera_id: camera_id in service.cameras,
+                metrics=metrics,
             )
             tasks.append(
                 asyncio.create_task(
@@ -246,6 +287,7 @@ async def _serve(
                 store,
                 config.reports,
                 cameras=lambda: list(service.cameras.values()),
+                metrics=metrics,
             )
             tasks.append(asyncio.create_task(writer.run_forever(), name="sheets"))
         try:
@@ -262,5 +304,8 @@ async def _serve(
             if judge is not None:
                 with contextlib.suppress(Exception):
                     await judge.aclose()
+            if exporter is not None:
+                with contextlib.suppress(Exception):
+                    await exporter.aclose()
             with contextlib.suppress(Exception):
                 await publisher.publish_availability(False)

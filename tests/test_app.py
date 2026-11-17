@@ -12,6 +12,7 @@ import pytest
 from conftest import FakeTransport, camera_payload
 from unifi_occupancy.app import OccupancyService, _open_store
 from unifi_occupancy.config import Config, ReportConfig
+from unifi_occupancy.metrics import Metrics
 from unifi_occupancy.models import MOTION, PERSON, DetectionEvent, parse_cameras
 from unifi_occupancy.protect import ProtectError
 from unifi_occupancy.publisher import StatePublisher
@@ -254,3 +255,105 @@ async def test_refresh_publishes_the_service_info_topic(
     payload = transport.payload_for("unifi-occupancy/info")
     assert payload is not None
     assert json.loads(payload)["cameras"] == 1
+
+
+# -- what the service tells the metrics -------------------------------------
+
+
+def instrumented(config: Config, transport: FakeTransport, responses: list):
+    metrics = Metrics()
+    clock = Clock()
+    service = OccupancyService(
+        config,
+        FakeProtect(responses),
+        StatePublisher(config, transport, metrics=metrics),
+        clock=clock,
+        metrics=metrics,
+    )
+    return service, metrics, clock
+
+
+async def test_a_poll_records_the_inventory(config: Config, transport: FakeTransport) -> None:
+    payload = [camera_payload(), camera_payload(id="cam-2", name="Back Yard", state="OFFLINE")]
+    service, metrics, _ = instrumented(config, transport, [payload])
+
+    await service.refresh()
+
+    assert metrics.cameras.value() == 2
+    assert metrics.cameras_connected.value() == 1
+    assert metrics.camera_detection_active.value(camera="front_door", kind=MOTION) == 0
+    assert metrics.camera_detection_enabled.value(camera="front_door", kind=MOTION) == 1
+
+
+async def test_a_camera_that_leaves_takes_its_series_with_it(
+    config: Config, transport: FakeTransport
+) -> None:
+    both = [camera_payload(), camera_payload(id="cam-2", name="Back Yard")]
+    service, metrics, _ = instrumented(config, transport, [both, [camera_payload()]])
+
+    await service.refresh()
+    await service.refresh()
+
+    assert metrics.cameras.value() == 1
+    assert 'camera="back_yard"' not in metrics.render()
+    assert 'camera="front_door"' in metrics.render()
+
+
+async def test_events_are_counted_by_kind_and_phase(
+    config: Config, transport: FakeTransport
+) -> None:
+    service, metrics, _ = instrumented(config, transport, [[camera_payload()]])
+    await service.refresh()
+
+    await service.handle_events(
+        events_from(
+            DetectionEvent("cam-1", frozenset({PERSON})),
+            DetectionEvent("cam-1", frozenset({PERSON}), start=False),
+        )
+    )
+
+    assert metrics.events.value(kind=PERSON, phase="start") == 1
+    assert metrics.events.value(kind=PERSON, phase="end") == 1
+
+
+async def test_a_detection_accumulates_seconds(config: Config, transport: FakeTransport) -> None:
+    service, metrics, clock = instrumented(config, transport, [[camera_payload()]])
+
+    await service.handle_events(events_from(DetectionEvent("cam-1", frozenset({PERSON}))))
+    await service.refresh()
+    clock.advance(5.0)
+    await service.refresh()
+
+    assert metrics.detections.value(camera="front_door", kind=PERSON) == 1
+    assert metrics.detection_seconds.value(camera="front_door", kind=PERSON) == 5
+
+
+async def test_poll_forever_records_each_run(config: Config, transport: FakeTransport) -> None:
+    service, metrics, _ = instrumented(config, transport, [[camera_payload()]])
+
+    task = asyncio.create_task(service.poll_forever())
+    while metrics.job_runs.value(job="poll", outcome="success") < 1:
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert metrics.protect_up.value() == 1
+    assert metrics.job_in_progress.value(job="poll") == 0
+    assert metrics.job_duration.count(job="poll") >= 1
+
+
+async def test_a_failing_poll_is_counted_and_lowers_protect_up(
+    config: Config, transport: FakeTransport
+) -> None:
+    service, metrics, _ = instrumented(config, transport, [ProtectError("protect is away")])
+
+    task = asyncio.create_task(service.poll_forever())
+    while metrics.job_runs.value(job="poll", outcome="error") < 1:
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert metrics.protect_up.value() == 0
+    assert metrics.job_runs.value(job="poll", outcome="success") == 0

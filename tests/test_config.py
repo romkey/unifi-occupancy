@@ -6,6 +6,7 @@ import pytest
 
 from unifi_occupancy.config import (
     DEFAULT_CONFIG_FILE,
+    DEFAULT_METRICS_PORT,
     DEFAULT_PERIODS,
     ConfigError,
     Period,
@@ -338,3 +339,65 @@ def test_a_switched_off_health_check_does_not_validate_its_settings() -> None:
     config = load_config({**MINIMAL, "CAMERA_HEALTH_API_BASE_URL": "not-a-url"})
 
     assert config.health.enabled is False
+
+
+# -- the Prometheus endpoint ------------------------------------------------
+
+TOKEN = "a-token-that-is-long-enough"
+
+
+def test_metrics_are_off_and_tokenless_by_default() -> None:
+    metrics = load_config(MINIMAL).metrics
+
+    assert metrics.enabled is False
+    assert metrics.token is None
+    assert metrics.port == DEFAULT_METRICS_PORT
+    assert metrics.path == "/metrics"
+
+
+def test_metrics_read_their_environment() -> None:
+    metrics = load_config(
+        MINIMAL
+        | {
+            "METRICS_ENABLED": "true",
+            "METRICS_HOST": "127.0.0.1",
+            "METRICS_PORT": "9999",
+            "METRICS_TOKEN": TOKEN,
+            "METRICS_PATH": "internal/metrics/",
+        }
+    ).metrics
+
+    assert metrics.enabled is True
+    assert metrics.host == "127.0.0.1"
+    assert metrics.port == 9999
+    assert metrics.token == TOKEN
+    # Written without a leading slash and with a trailing one; stored tidily.
+    assert metrics.path == "/internal/metrics"
+
+
+def test_enabling_metrics_without_a_token_is_an_error() -> None:
+    with pytest.raises(ConfigError, match="METRICS_TOKEN is required"):
+        load_config(MINIMAL | {"METRICS_ENABLED": "yes"})
+
+
+def test_a_token_has_to_be_long_enough_to_be_one() -> None:
+    with pytest.raises(ConfigError, match="at least 16 characters"):
+        load_config(MINIMAL | {"METRICS_ENABLED": "yes", "METRICS_TOKEN": "hunter2"})
+
+
+def test_a_token_is_not_demanded_while_the_endpoint_is_off() -> None:
+    assert load_config(MINIMAL | {"METRICS_ENABLED": "false"}).metrics.token is None
+
+
+def test_the_port_has_to_be_a_port() -> None:
+    with pytest.raises(ConfigError, match="must be a port number"):
+        load_config(
+            MINIMAL | {"METRICS_ENABLED": "1", "METRICS_TOKEN": TOKEN, "METRICS_PORT": "70000"}
+        )
+
+
+def test_an_empty_path_falls_back_to_the_default() -> None:
+    environment = {"METRICS_ENABLED": "1", "METRICS_TOKEN": TOKEN, "METRICS_PATH": "/"}
+    config = load_config(MINIMAL | environment)
+
+    assert config.metrics.path == "/metrics"

@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from conftest import FakeTransport, camera_payload
 from unifi_occupancy.config import Config
+from unifi_occupancy.metrics import Metrics
 from unifi_occupancy.models import MOTION, PERSON, SMOKE, DetectionEvent, parse_camera
 from unifi_occupancy.publisher import StatePublisher
 from unifi_occupancy.state import DetectionTracker
@@ -177,3 +180,39 @@ async def test_topic_prefix_is_honoured(config: Config, transport: FakeTransport
     await StatePublisher(tuned, transport).publish_state(snapshot())
 
     assert "sensors/unifi/front_door/motion" in transport.topics
+
+
+async def test_publishing_counts_messages_bytes_and_suppressions(
+    config: Config, transport: FakeTransport
+) -> None:
+    metrics = Metrics()
+    publisher = StatePublisher(config, transport, metrics=metrics)
+    state = snapshot(events=[PERSON])
+
+    await publisher.publish_state(state)
+    published = metrics.mqtt_publishes.value(outcome="success")
+
+    assert published == len(transport.messages)
+    assert metrics.mqtt_published_bytes.value() > 0
+    assert metrics.mqtt_suppressed.value() == 0
+
+    # The same state again: the unchanged topics are skipped, and counted.
+    await publisher.publish_state(state)
+
+    assert metrics.mqtt_publishes.value(outcome="success") < published * 2
+    assert metrics.mqtt_suppressed.value() > 0
+
+
+async def test_a_publish_that_fails_is_counted_and_still_raises(config: Config) -> None:
+    class Broken:
+        async def publish(self, topic: str, payload: str | None, *, retain: bool, qos: int) -> None:
+            raise ConnectionError("broker is away")
+
+    metrics = Metrics()
+    publisher = StatePublisher(config, Broken(), metrics=metrics)
+
+    with pytest.raises(ConnectionError):
+        await publisher.publish_availability(True)
+
+    assert metrics.mqtt_publishes.value(outcome="error") == 1
+    assert metrics.mqtt_publishes.value(outcome="success") == 0

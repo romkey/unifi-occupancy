@@ -24,6 +24,11 @@ services:
       - ALL
     tmpfs:
       - /tmp
+    # Uncomment with METRICS_ENABLED=true to let Prometheus reach the endpoint.
+    # Bind it to one interface -- "127.0.0.1:9833:9833" -- if Prometheus is
+    # local, rather than publishing it to the whole network.
+    #ports:
+    #  - "9833:9833"
     volumes:
       # Groups and periods. Nothing is written here; no file, no sheets.
       - ./config:/config:ro

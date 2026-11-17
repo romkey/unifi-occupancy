@@ -22,6 +22,7 @@ from .discovery import (
 )
 from .health import HealthVerdict
 from .info import camera_info_payload, service_info_payload
+from .metrics import OUTCOME_ERROR, OUTCOME_SUCCESS, Metrics, default_metrics
 from .models import DETECTION_KEYS, Camera
 from .state import CameraState
 from .topics import (
@@ -48,9 +49,12 @@ class Transport(Protocol):
 class StatePublisher:
     """Publishes detection state, skipping values that have not changed."""
 
-    def __init__(self, config: Config, transport: Transport) -> None:
+    def __init__(
+        self, config: Config, transport: Transport, metrics: Metrics | None = None
+    ) -> None:
         self._config = config
         self._transport = transport
+        self._metrics = metrics or default_metrics()
         self._published: dict[str, str | None] = {}
         self._announced: set[str] = set()
         #: Cameras whose stale health topics we have already cleaned up.
@@ -60,13 +64,19 @@ class StatePublisher:
 
     async def _send(self, topic: str, payload: str | None, *, force: bool = False) -> None:
         if not force and self._published.get(topic, object()) == payload:
+            self._metrics.record_publish_suppressed()
             return
-        await self._transport.publish(
-            topic,
-            payload,
-            retain=self._config.mqtt.retain,
-            qos=self._config.mqtt.qos,
-        )
+        try:
+            await self._transport.publish(
+                topic,
+                payload,
+                retain=self._config.mqtt.retain,
+                qos=self._config.mqtt.qos,
+            )
+        except Exception:
+            self._metrics.record_publish(payload, outcome=OUTCOME_ERROR)
+            raise
+        self._metrics.record_publish(payload, outcome=OUTCOME_SUCCESS)
         self._published[topic] = payload
 
     async def publish_availability(self, online: bool) -> None:

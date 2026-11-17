@@ -91,6 +91,7 @@ def service_info_payload(
             "ha_discovery": config.discovery.enabled,
             "occupancy_sheets": config.reports is not None and config.reports.enabled,
             "camera_health": config.health.enabled,
+            "metrics": config.metrics.enabled,
         },
         "detections": list(DETECTION_KEYS),
     }
