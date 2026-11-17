@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from unifi_occupancy.metrics import Metrics
 from unifi_occupancy.models import MOTION, PERSON, Camera
 from unifi_occupancy.recorder import EventRecorder
 from unifi_occupancy.state import CameraState
@@ -113,3 +114,20 @@ def test_a_failing_store_does_not_propagate(caplog: pytest.LogCaptureFixture) ->
     # The roster and the event log are complained about once each: neither
     # failing is allowed to swallow the other's one warning.
     assert caplog.text.count("could not record the camera roster") == 1
+
+
+def test_edges_and_failures_reach_the_metrics(store: EventStore) -> None:
+    metrics = Metrics()
+    recorder = EventRecorder(store, clock=Clock(), metrics=metrics)
+
+    recorder.observe(state(**{PERSON: True}))
+    recorder.observe(state(**{PERSON: False}))
+
+    assert metrics.recorded_edges.value(kind=PERSON, edge="start") == 1
+    assert metrics.recorded_edges.value(kind=PERSON, edge="end") == 1
+    assert metrics.recorder_failures.value(operation="event") == 0
+
+    store.close()
+    recorder.observe(state(**{MOTION: True}))
+
+    assert metrics.recorder_failures.value(operation="event") == 1

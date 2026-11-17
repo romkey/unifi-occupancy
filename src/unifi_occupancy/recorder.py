@@ -13,6 +13,7 @@ import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
 
+from .metrics import Metrics, default_metrics
 from .models import DETECTION_KEYS
 from .state import CameraState
 from .store import EventStore
@@ -36,10 +37,12 @@ class EventRecorder:
         store: EventStore,
         kinds: tuple[str, ...] = DETECTION_KEYS,
         clock: Callable[[], datetime] = _now,
+        metrics: Metrics | None = None,
     ) -> None:
         self._store = store
         self._kinds = kinds
         self._clock = clock
+        self._metrics = metrics or default_metrics()
         self._active: set[tuple[str, str]] = set()
         #: Last name written to the roster per camera, so a poll that changed
         #: nothing costs no write.
@@ -65,11 +68,13 @@ class EventRecorder:
                 else:
                     self._store.end_event(camera.id, kind, now)
             except Exception as exc:  # noqa: BLE001 - history is not worth a crash
+                self._metrics.record_recorder_failure("event")
                 if not self._complained:
                     logger.warning("could not record detection history: %s", exc)
                     self._complained = True
                 return
             self._complained = False
+            self._metrics.record_edge(kind, start=active)
             if active:
                 self._active.add(pair)
             else:
@@ -82,6 +87,7 @@ class EventRecorder:
         try:
             self._store.record_camera(camera_id, camera_name, now)
         except Exception as exc:  # noqa: BLE001 - history is not worth a crash
+            self._metrics.record_recorder_failure("roster")
             if not self._roster_complained:
                 logger.warning("could not record the camera roster: %s", exc)
                 self._roster_complained = True
@@ -95,6 +101,7 @@ class EventRecorder:
         try:
             self._store.forget_cameras(camera_ids)
         except Exception as exc:  # noqa: BLE001 - as above
+            self._metrics.record_recorder_failure("forget")
             logger.warning("could not drop %d camera(s) from the roster: %s", len(camera_ids), exc)
         for camera_id in camera_ids:
             self._roster.pop(camera_id, None)
@@ -102,5 +109,6 @@ class EventRecorder:
             try:
                 self._store.end_event(pair[0], pair[1], now)
             except Exception as exc:  # noqa: BLE001 - as above
+                self._metrics.record_recorder_failure("close")
                 logger.warning("could not close history for %s: %s", pair[0], exc)
             self._active.discard(pair)

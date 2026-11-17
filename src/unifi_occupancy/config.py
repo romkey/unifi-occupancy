@@ -194,6 +194,32 @@ class DiscoveryConfig:
     node_id: str = "unifi_occupancy"
 
 
+#: Arbitrary, and outside the ranges Prometheus' own exporters have claimed.
+DEFAULT_METRICS_PORT = 9833
+
+#: A token shorter than this is not a secret, it is a speed bump.
+MIN_METRICS_TOKEN_CHARS = 16
+
+
+@dataclass(frozen=True)
+class MetricsConfig:
+    """The Prometheus endpoint: off unless asked for, and never unauthenticated.
+
+    Switching this on opens a listening socket on a process whose whole job so
+    far has been to make outbound connections, so it is opt-in, and a token is
+    required rather than optional: an exporter that answers anyone who asks
+    hands out a camera-by-camera map of a building's movement.
+    """
+
+    enabled: bool = False
+    #: Binds every interface by default so a published container port works.
+    host: str = "0.0.0.0"
+    port: int = DEFAULT_METRICS_PORT
+    #: Compared with ``hmac.compare_digest`` against the bearer token.
+    token: str | None = None
+    path: str = "/metrics"
+
+
 MINUTES_PER_DAY = 24 * 60
 
 DEFAULT_CONFIG_FILE = Path("/config/config.yaml")
@@ -468,6 +494,7 @@ class Config:
     mqtt: MqttConfig
     discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
     health: HealthConfig = field(default_factory=HealthConfig)
+    metrics: MetricsConfig = field(default_factory=MetricsConfig)
     log_level: str = "INFO"
     #: How long a smart detection stays "on" after the last event that reported it.
     detection_hold_seconds: float = 30.0
@@ -501,6 +528,41 @@ def _health_config(env: Mapping[str, str]) -> HealthConfig:
         request_timeout=_get_positive_float(env, "CAMERA_HEALTH_REQUEST_TIMEOUT", 60.0),
         high_quality_snapshot=_get_bool(env, "CAMERA_HEALTH_HIGH_QUALITY_SNAPSHOT", False),
         max_explanation_chars=_get_int(env, "CAMERA_HEALTH_MAX_EXPLANATION_CHARS", 200),
+    )
+
+
+def _metrics_config(env: Mapping[str, str]) -> MetricsConfig:
+    """The Prometheus endpoint, which has to be asked for and has to have a token."""
+    enabled = _get_bool(env, "METRICS_ENABLED", False)
+    token = _get(env, "METRICS_TOKEN")
+    path = _get(env, "METRICS_PATH", "/metrics") or "/metrics"
+    port = _get_int(env, "METRICS_PORT", DEFAULT_METRICS_PORT)
+
+    if not path.startswith("/"):
+        path = f"/{path}"
+    path = path.rstrip("/") or "/metrics"
+
+    # Only checked when the endpoint is actually on, so a half-written .env
+    # never stops the bridge itself from starting.
+    if enabled:
+        if token is None:
+            raise ConfigError(
+                "METRICS_TOKEN is required when METRICS_ENABLED is set; "
+                "generate one with `openssl rand -hex 32`"
+            )
+        if len(token) < MIN_METRICS_TOKEN_CHARS:
+            raise ConfigError(
+                f"METRICS_TOKEN must be at least {MIN_METRICS_TOKEN_CHARS} characters"
+            )
+        if not 1 <= port <= 65535:
+            raise ConfigError(f"METRICS_PORT must be a port number, got {port}")
+
+    return MetricsConfig(
+        enabled=enabled,
+        host=_get(env, "METRICS_HOST", "0.0.0.0") or "0.0.0.0",
+        port=port,
+        token=token,
+        path=path,
     )
 
 
@@ -543,12 +605,14 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
     )
 
     health = _health_config(env)
+    metrics = _metrics_config(env)
 
     return Config(
         protect=protect,
         mqtt=mqtt,
         discovery=discovery,
         health=health,
+        metrics=metrics,
         log_level=(_get(env, "LOG_LEVEL", "INFO") or "INFO").upper(),
         detection_hold_seconds=_get_positive_float(env, "DETECTION_HOLD_SECONDS", 30.0),
         config_file=Path(_get(env, "CONFIG_FILE") or DEFAULT_CONFIG_FILE),

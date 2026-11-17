@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import ssl
+import time
 from collections.abc import AsyncIterator
 from types import TracebackType
 from typing import Any
@@ -24,6 +25,7 @@ import httpx
 import websockets
 
 from .config import ProtectConfig
+from .metrics import OUTCOME_AUTH_ERROR, OUTCOME_ERROR, OUTCOME_SUCCESS, Metrics, default_metrics
 from .models import Camera, DetectionEvent, parse_cameras, parse_event
 
 logger = logging.getLogger(__name__)
@@ -35,6 +37,19 @@ class ProtectError(RuntimeError):
 
 class ProtectAuthError(ProtectError):
     """The API key was rejected."""
+
+
+def endpoint_label(path: str) -> str:
+    """The path with camera ids taken out of it.
+
+    ``/cameras/abc123/snapshot`` and ``/cameras/def456/snapshot`` are the same
+    endpoint; labelling them separately would put one metric series per camera
+    on a metric that is about Protect, not about cameras.
+    """
+    parts = path.split("?", 1)[0].strip("/").split("/")
+    if len(parts) > 1 and parts[0] == "cameras":
+        parts = ["cameras", "{id}", *parts[2:]]
+    return "/" + "/".join(part for part in parts if part)
 
 
 def _ssl_context(verify: bool) -> ssl.SSLContext:
@@ -50,8 +65,14 @@ def _ssl_context(verify: bool) -> ssl.SSLContext:
 class ProtectClient:
     """Read-only Protect client."""
 
-    def __init__(self, config: ProtectConfig, client: httpx.AsyncClient | None = None) -> None:
+    def __init__(
+        self,
+        config: ProtectConfig,
+        client: httpx.AsyncClient | None = None,
+        metrics: Metrics | None = None,
+    ) -> None:
         self._config = config
+        self._metrics = metrics or default_metrics()
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(
             base_url=config.base_url,
@@ -79,11 +100,25 @@ class ProtectClient:
         if self._owns_client:
             await self._client.aclose()
 
+    def _record(self, path: str, outcome: str, started: float) -> None:
+        self._metrics.record_protect_request(
+            endpoint_label(path), outcome, time.perf_counter() - started
+        )
+
     async def _get(self, path: str, *, optional: bool = False) -> Any:
+        started = time.perf_counter()
         try:
             response = await self._client.get(path)
         except httpx.HTTPError as exc:
+            self._record(path, OUTCOME_ERROR, started)
             raise ProtectError(f"request to {path} failed: {exc}") from exc
+
+        if response.status_code in (401, 403):
+            self._record(path, OUTCOME_AUTH_ERROR, started)
+        elif response.status_code >= 400 and not (optional and response.status_code == 404):
+            self._record(path, OUTCOME_ERROR, started)
+        else:
+            self._record(path, OUTCOME_SUCCESS, started)
 
         if response.status_code in (401, 403):
             raise ProtectAuthError(
@@ -131,10 +166,19 @@ class ProtectClient:
         """
         quality = "true" if high_quality else "false"
         path = f"/cameras/{camera_id}/snapshot?highQuality={quality}"
+        started = time.perf_counter()
         try:
             response = await self._client.get(path, headers={"Accept": "image/jpeg"})
         except httpx.HTTPError as exc:
+            self._record(path, OUTCOME_ERROR, started)
             raise ProtectError(f"snapshot request for {camera_id} failed: {exc}") from exc
+
+        if response.status_code in (401, 403):
+            self._record(path, OUTCOME_AUTH_ERROR, started)
+        elif response.status_code >= 400:
+            self._record(path, OUTCOME_ERROR, started)
+        else:
+            self._record(path, OUTCOME_SUCCESS, started)
 
         if response.status_code in (401, 403):
             raise ProtectAuthError(
@@ -152,18 +196,29 @@ class ProtectClient:
         Callers are expected to reconnect; this deliberately does not retry so
         the supervising loop owns the backoff policy.
         """
-        async with websockets.connect(
-            self._config.websocket_url,
-            additional_headers=self.headers,
-            ssl=_ssl_context(self._config.verify_ssl),
-            open_timeout=self._config.request_timeout,
-            ping_interval=20,
-        ) as socket:
-            logger.info("subscribed to Protect event stream")
-            async for message in socket:
-                event = _decode(message)
-                if event is not None:
-                    yield event
+        try:
+            async with websockets.connect(
+                self._config.websocket_url,
+                additional_headers=self.headers,
+                ssl=_ssl_context(self._config.verify_ssl),
+                open_timeout=self._config.request_timeout,
+                ping_interval=20,
+            ) as socket:
+                self._metrics.record_websocket_connected()
+                logger.info("subscribed to Protect event stream")
+                try:
+                    async for message in socket:
+                        event = _decode(message)
+                        self._metrics.record_event_frame(decoded=event is not None)
+                        if event is not None:
+                            yield event
+                finally:
+                    self._metrics.record_websocket_closed()
+        except Exception as exc:
+            # Cancellation is not a failure: ``CancelledError`` and
+            # ``GeneratorExit`` are both ``BaseException`` and go straight past.
+            self._metrics.record_websocket_failure(type(exc).__name__)
+            raise
 
 
 def _decode(message: str | bytes) -> DetectionEvent | None:

@@ -21,6 +21,10 @@ It can also keep those booleans. Give it a `config.yaml` and it writes a **daily
 sheet** — one HTML page per day, a timeline per camera and per group, so you can see at a
 glance how busy an area was and when. Still just booleans; still no pictures.
 
+And it can tell you how it is doing: an optional, token-protected **Prometheus endpoint**
+reports every poll, every API failure, every detection's duration and every background job
+it runs.
+
 ## What it publishes
 
 For every camera the API returns, four detections:
@@ -78,7 +82,13 @@ features are switched on, and how many cameras it can see.
     "console": { "name": "Dream Machine", "type": "UDMPRO", "version": "6.3.52" }
   },
   "mqtt": { "topic_prefix": "unifi-occupancy", "retain": true, "qos": 0 },
-  "features": { "websocket": true, "ha_discovery": true, "occupancy_sheets": true },
+  "features": {
+    "websocket": true,
+    "ha_discovery": true,
+    "occupancy_sheets": true,
+    "camera_health": false,
+    "metrics": false
+  },
   "detections": ["motion", "person", "siren", "smoke"],
   "cameras": 7
 }
@@ -332,6 +342,112 @@ That reads the history and writes the pages; it needs neither the controller nor
 broker. Cameras that have never fired are listed from the stored roster, so a rebuild looks
 the same as a live refresh.
 
+## Prometheus metrics
+
+Set `METRICS_ENABLED=true` and a token, and the service serves a Prometheus endpoint on
+port 9833:
+
+```bash
+METRICS_ENABLED=true
+METRICS_TOKEN=$(openssl rand -hex 32)
+```
+
+```bash
+curl -H "Authorization: Bearer $METRICS_TOKEN" http://nas.example:9833/metrics
+```
+
+It is off by default, and when it is on a token is **required** — `METRICS_ENABLED` without
+`METRICS_TOKEN` is a configuration error and the service will not start. An open exporter
+here is not a dull list of request counts: `unifi_occupancy_camera_detection_active` is a
+live, camera-by-camera map of who is moving where in a building.
+
+In Prometheus:
+
+```yaml
+scrape_configs:
+  - job_name: unifi-occupancy
+    static_configs:
+      - targets: ["nas.example:9833"]
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/unifi-occupancy.token
+```
+
+The token may also be sent as `X-Metrics-Token:` instead of `Authorization: Bearer`, for
+agents that find that easier. It is never read from a query string, so it cannot end up in
+a proxy log or somebody's shell history. Requests without it get `401` whatever path they
+ask for — including the real one — so moving the endpoint with `METRICS_PATH` actually
+hides it.
+
+With Docker, publish the port (it is not published by default):
+
+```yaml
+services:
+  unifi-occupancy:
+    ports:
+      - "9833:9833"
+```
+
+### What is in it
+
+Everything the process knows about itself, and nothing a scrape has to go and fetch:
+answering `/metrics` touches no camera, no controller and no database. Every name below is
+prefixed `unifi_occupancy_`; the table leaves that off to stay readable.
+
+| Family | What it tells you |
+| --- | --- |
+| `build_info`, `start_time_seconds`, `uptime_seconds` | Version, Python, architecture, how long since the last restart |
+| `feature_enabled{feature}`, `configured_seconds{setting}` | Which optional features are on, and the intervals they run at |
+| `protect_info{...}` | The controller and console being read, as labels |
+| `protect_up`, `protect_cameras_polled` | Whether the last poll worked, and what it returned |
+| `protect_requests_total{endpoint,outcome}` | Every API call, split `success` / `error` / `auth_error` — an expired API key shows up here first |
+| `protect_request_duration_seconds{endpoint}` | How long the controller takes to answer |
+| `websocket_connected`, `websocket_connects_total`, `websocket_failures_total{cause}` | Whether the event stream is up, and how much it has been flapping |
+| `event_frames_total{outcome}`, `events_total{kind,phase}` | Frames read, and the detections in them by kind and by start/end |
+| `cameras`, `cameras_connected`, `camera_info{...}`, `camera_connected{camera}` | The inventory, and each camera's identity and link state |
+| `camera_detection_active{camera,kind}` | What is firing right now |
+| `camera_detection_enabled{camera,kind}`, `camera_detection_supported{camera,kind}` | What each camera can do, and what is switched on — a detection quietly turned off in Protect is visible here |
+| `detections_total{camera,kind}`, `detection_seconds_total{camera,kind}` | How often each detection has fired, and how long it has spent on |
+| `mqtt_publishes_total{outcome}`, `mqtt_published_bytes_total`, `mqtt_publishes_suppressed_total`, `mqtt_last_publish_timestamp_seconds` | What went to the broker, what was skipped as unchanged, and when |
+| `job_runs_total{job,outcome}`, `job_duration_seconds{job}`, `job_in_progress{job}`, `job_last_success_timestamp_seconds{job}` | The four background jobs — `poll`, `events`, `health_sweep`, `sheets` — their outcomes, durations and last success |
+| `health_checks_total{camera,verdict}`, `health_check_duration_seconds`, `camera_health{camera,status}`, `health_last_check_timestamp_seconds{camera}` | The optional vision check: verdicts per camera, how long each took, when each was last looked at |
+| `recorded_edges_total{kind,edge}`, `recorder_failures_total{operation}`, `sheets_written_total` | The history database and the daily sheets |
+| `http_requests_total{path,status}`, `http_request_duration_seconds` | This endpoint itself |
+| `process_cpu_seconds_total`, `process_max_resident_bytes`, `asyncio_tasks` | What the process is costing |
+
+Counters exist at zero before anything has happened, so a service that has been quiet all
+day reads as quiet rather than as broken.
+
+A few queries to start from:
+
+```promql
+# The API key stopped working.
+rate(unifi_occupancy_protect_requests_total{outcome="auth_error"}[5m]) > 0
+
+# The event stream is flapping.
+rate(unifi_occupancy_websocket_failures_total[15m]) > 0
+
+# Nothing has reached the broker in ten minutes.
+time() - unifi_occupancy_mqtt_last_publish_timestamp_seconds > 600
+
+# The sheets have not been written for two hours.
+time() - unifi_occupancy_job_last_success_timestamp_seconds{job="sheets"} > 7200
+
+# A camera the vision check thinks is blocked, smeared or pointed at a wall.
+unifi_occupancy_camera_health{status="bad"} == 1
+
+# Busiest cameras over a day.
+topk(5, increase(unifi_occupancy_detection_seconds_total{kind="person"}[24h]))
+```
+
+### Cardinality
+
+Per-camera series are the only ones that grow, and there is no label anywhere carrying an
+event id, a Protect object id or a timestamp. A camera removed from the controller has its
+series dropped on the next poll rather than frozen at its last value, and requests for an
+unknown path are labelled `other` rather than with whatever URL a stranger tried — so
+nobody can grow this process's memory one request at a time.
+
 ## How it works
 
 Two sources, combined:
@@ -422,6 +538,11 @@ groups and the daily sheets are YAML; see [above](#configuration).
 | `CAMERA_HEALTH_REQUEST_TIMEOUT` | `60` | Vision request timeout, seconds |
 | `CAMERA_HEALTH_HIGH_QUALITY_SNAPSHOT` | `false` | Full-resolution snapshots |
 | `CAMERA_HEALTH_MAX_EXPLANATION_CHARS` | `200` | Trim length for a `bad` explanation |
+| `METRICS_ENABLED` | `false` | Serve the Prometheus endpoint |
+| `METRICS_TOKEN` | unset | *Required* when the endpoint is on; at least 16 characters |
+| `METRICS_HOST` | `0.0.0.0` | Address to bind |
+| `METRICS_PORT` | `9833` | Port to bind |
+| `METRICS_PATH` | `/metrics` | Path the endpoint answers on |
 | `CONFIG_FILE` | `/config/config.yaml` | Groups, periods and sheets. No file, no sheets |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 
@@ -463,6 +584,8 @@ mosquitto_sub -h localhost -t 'unifi-occupancy/#' -v
 | `info.py` | The `info` metadata payloads for the service and each camera |
 | `health.py` | The optional vision check: snapshot, ask, verdict, schedule |
 | `publisher.py` | Topic layout, change detection, retraction |
+| `metrics.py` | The counters, gauges and histograms, and the exposition format |
+| `exporter.py` | The token-protected `/metrics` HTTP endpoint |
 | `recorder.py` | Published state → detection edges worth keeping |
 | `store.py` | The SQLite detection history, camera roster and per-day summaries |
 | `report.py` | Grouping, the timeline arithmetic, the refresh schedule |
@@ -488,6 +611,11 @@ controller and no broker.
 - The API key exists only in the process environment. It is not logged and not published.
   Nor is the vision endpoint's key, if you set one.
 - Nothing subscribes to MQTT; this process only writes.
+- The Prometheus endpoint is the only listening socket this service ever opens, it is off
+  until you switch it on, and it answers nobody without the token. What it reports is the
+  same class of fact as the MQTT topics — which cameras exist and what they are detecting —
+  so treat the token like a key to that, and prefer binding `METRICS_HOST` to an address
+  only your monitoring host can reach.
 - The occupancy sheets record camera names, detection kinds and timestamps. Nothing else is
   stored, and nothing in `/var/www/html` is served by this process — it only writes the
   files. They are as public as you make them.

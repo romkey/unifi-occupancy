@@ -21,6 +21,7 @@ from unifi_occupancy.health import (
     VisionJudge,
     parse_verdict,
 )
+from unifi_occupancy.metrics import Metrics
 from unifi_occupancy.models import parse_camera
 from unifi_occupancy.publisher import StatePublisher
 from unifi_occupancy.state import DetectionTracker
@@ -553,3 +554,41 @@ async def test_an_enabled_check_announces_rather_than_clears(
 
     payload = transport.payload_for("homeassistant/sensor/unifi_occupancy_front_door/health/config")
     assert payload is not None
+
+
+# -- what a sweep leaves in the metrics --------------------------------------
+
+
+async def test_a_verdict_is_counted_timed_and_remembered() -> None:
+    metrics = Metrics()
+    monitor = CameraHealthMonitor(
+        HEALTH,
+        FakeSnapshots(),
+        FakeSink(),
+        FakeJudge(HealthVerdict(BAD, "a shrub")),
+        sleep=lambda _seconds: None,
+        metrics=metrics,
+    )
+
+    await monitor.sweep([CAMERA])
+
+    assert metrics.health_checks.value(camera="front_door", verdict=BAD) == 1
+    assert metrics.camera_health.value(camera="front_door", status=BAD) == 1
+    assert metrics.camera_health.value(camera="front_door", status=GOOD) == 0
+    assert metrics.health_check_duration.count() == 1
+
+
+async def test_a_check_that_could_not_happen_is_counted_as_unknown() -> None:
+    metrics = Metrics()
+    monitor = CameraHealthMonitor(
+        HEALTH,
+        FakeSnapshots(result=None),
+        FakeSink(),
+        FakeJudge(HealthVerdict(GOOD)),
+        sleep=lambda _seconds: None,
+        metrics=metrics,
+    )
+
+    await monitor.check(CAMERA)
+
+    assert metrics.health_checks.value(camera="front_door", verdict=UNKNOWN) == 1

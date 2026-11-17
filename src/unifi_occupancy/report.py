@@ -21,6 +21,7 @@ from itertools import pairwise
 from pathlib import Path
 
 from .config import MINUTES_PER_DAY, ReportConfig
+from .metrics import OUTCOME_ERROR, OUTCOME_SUCCESS, Metrics, default_metrics
 from .models import DETECTION_KEYS, Camera, slugify
 from .render import (
     ALWAYS_RENDERED,
@@ -138,11 +139,13 @@ class SheetWriter:
         reports: ReportConfig,
         cameras: Callable[[], Sequence[Camera]] = lambda: (),
         clock: Callable[[], datetime] = lambda: datetime.now(tz=UTC),
+        metrics: Metrics | None = None,
     ) -> None:
         self._store = store
         self._reports = reports
         self._cameras = cameras
         self._clock = clock
+        self._metrics = metrics or default_metrics()
         self._warned_unmatched: set[str] = set()
 
     # -- grouping ---------------------------------------------------------
@@ -396,6 +399,7 @@ class SheetWriter:
         scratch = directory / f".{filename}.tmp"
         scratch.write_text(html, encoding="utf-8")
         scratch.replace(target)
+        self._metrics.record_sheets_written()
         return target
 
     def _pruned(self, day: date) -> bool:
@@ -560,11 +564,19 @@ class SheetWriter:
         connection is only ever touched from one place.
         """
         while True:
+            started = self._clock()
+            self._metrics.start_job("sheets")
+            outcome = OUTCOME_SUCCESS
             try:
                 self.refresh()
             except asyncio.CancelledError:
+                self._metrics.job_in_progress.set(0, job="sheets")
                 raise
             except Exception as exc:  # noqa: BLE001 - sheets must not stop the bridge
+                outcome = OUTCOME_ERROR
                 logger.warning("could not write occupancy sheets: %s", exc)
+            self._metrics.finish_job(
+                "sheets", outcome, max(0.0, (self._clock() - started).total_seconds())
+            )
             wake = next_refresh(self._clock(), self._reports)
             await asyncio.sleep(max(1.0, (wake - self._clock()).total_seconds()))

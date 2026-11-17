@@ -30,6 +30,7 @@ from typing import Any, Protocol
 import httpx
 
 from .config import HealthConfig
+from .metrics import OUTCOME_ERROR, OUTCOME_SUCCESS, Metrics, default_metrics
 from .models import Camera
 
 logger = logging.getLogger(__name__)
@@ -296,6 +297,7 @@ class CameraHealthMonitor:
         sleep: Callable[[float], Any] = asyncio.sleep,
         clock: Callable[[], float] = time.monotonic,
         is_current: Callable[[str], bool] | None = None,
+        metrics: Metrics | None = None,
     ) -> None:
         self._config = config
         self._snapshots = snapshots
@@ -304,6 +306,7 @@ class CameraHealthMonitor:
         self._sleep = sleep
         self._clock = clock
         self._is_current = is_current
+        self._metrics = metrics or default_metrics()
 
     def _still_there(self, camera: Camera) -> bool:
         """Whether the camera is still in the inventory.
@@ -317,6 +320,13 @@ class CameraHealthMonitor:
         return self._is_current is None or self._is_current(camera.id)
 
     async def check(self, camera: Camera) -> HealthVerdict:
+        """One camera: snapshot, ask, verdict, and how long all that took."""
+        started = self._clock()
+        verdict = await self._check(camera)
+        self._metrics.record_health_check(camera, verdict.status, max(0.0, self._clock() - started))
+        return verdict
+
+    async def _check(self, camera: Camera) -> HealthVerdict:
         """One camera: snapshot, ask, verdict. Never raises."""
         if not camera.connected:
             return HealthVerdict(
@@ -384,6 +394,17 @@ class CameraHealthMonitor:
                 await self._sleep(min(5.0, self._config.interval_seconds))
                 continue
             started = self._clock()
-            await self.sweep(batch)
+            self._metrics.start_job("health_sweep")
+            try:
+                await self.sweep(batch)
+            except asyncio.CancelledError:
+                self._metrics.job_in_progress.set(0, job="health_sweep")
+                raise
+            except Exception:
+                self._metrics.finish_job(
+                    "health_sweep", OUTCOME_ERROR, max(0.0, self._clock() - started)
+                )
+                raise
             elapsed = self._clock() - started
+            self._metrics.finish_job("health_sweep", OUTCOME_SUCCESS, max(0.0, elapsed))
             await self._sleep(max(1.0, self._config.interval_seconds - elapsed))
