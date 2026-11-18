@@ -286,6 +286,30 @@ def test_an_unreadable_answer_is_unknown_rather_than_a_match() -> None:
     assert parse_answer('{"match": "perhaps"}')[0] == UNKNOWN
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        # A word that merely starts with "yes" or "true" is not a yes.
+        "Yesterday's frame showed the same empty doorway.",
+        "Truly ordinary: a doormat and a parcel.",
+        # Scene language describes the frame without answering this trigger's
+        # question. A person being visible must not fire a fire trigger.
+        "A person is visible on the step, carrying a bag.",
+        "Two parcels are present beside the door.",
+        "A delivery van was detected at the kerb.",
+        "The porch light is on.",
+    ],
+)
+def test_a_description_that_answers_nothing_never_reads_as_a_match(text: str) -> None:
+    assert parse_answer(text)[0] != MATCH
+
+
+def test_a_leading_yes_still_answers_the_question() -> None:
+    assert parse_answer("Yes.")[0] == MATCH
+    assert parse_answer("Yes - the doormat is alight.")[0] == MATCH
+    assert parse_answer("Affirmative, there are flames.")[0] == MATCH
+
+
 def test_explanations_are_trimmed() -> None:
     long = "x" * 500
     _, explanation = parse_answer(json.dumps({"match": True, "explanation": long}), limit=50)

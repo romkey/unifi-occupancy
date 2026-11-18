@@ -79,16 +79,29 @@ _EXPLANATION_KEYS: tuple[str, ...] = ("explanation", "reason", "why", "descripti
 _TRUE_WORDS = frozenset({"true", "yes", "y", "1", "match", "matched", "present", "detected"})
 _FALSE_WORDS = frozenset({"false", "no", "n", "0", "clear", "absent", "none", "nothing"})
 
-#: Prose that means "I can see it", matched on whole words and only when the
+#: Prose that *answers the question*, matched on whole words and only when the
 #: clause before it does not negate it.
+#:
+#: Only words that answer, never words that describe. A model saying something
+#: is "visible", "present", "detected" or "burning" has described the frame
+#: without saying which question it was answering, and the question is
+#: different for every trigger -- "a person is visible on the step" must not
+#: fire a trigger that asked about fire. Those readings fall through to
+#: :data:`UNKNOWN`, which leaves the boolean where it was.
 _MATCH_WORDS = re.compile(
-    r"\b(?:yes|present|visible|detected|burning|on fire|confirmed|matches|matched)\b"
+    r"\b(?:yes|yep|yeah|affirmative|correct|confirmed|match(?:e[sd])?|triggered)\b"
 )
 #: Prose that means "I cannot". Checked first: a reading that is not clearly a
 #: hit should not become one, because a hit is what rings an alarm.
 _CLEAR_WORDS = re.compile(
     r"\b(?:no|not|none|nothing|never|absent|clear|empty|cannot|can't|unable|negative|false)\b"
 )
+
+#: A reply that opens with a bare yes or no is answering the question directly.
+#: Anchored on a word boundary, so "yesterday the step was clear" and "truly
+#: nothing is there" are not read as a yes.
+_YES_PREFIX = re.compile(r"^(?:yes|true)\b")
+_NO_PREFIX = re.compile(r"^(?:no|false)\b")
 
 
 @dataclass(frozen=True)
@@ -181,9 +194,9 @@ def parse_answer(text: str, *, limit: int = 200) -> tuple[str, str | None]:
         return UNKNOWN, tidy(f"could not read the model's reply: {text}", limit)
 
     lowered = text.strip().lower()
-    if lowered.startswith(("yes", "true")):
+    if _YES_PREFIX.match(lowered):
         return MATCH, tidy(text, limit)
-    if lowered.startswith(("no", "false")):
+    if _NO_PREFIX.match(lowered):
         return CLEAR, None
     if _CLEAR_WORDS.search(lowered):
         return CLEAR, None

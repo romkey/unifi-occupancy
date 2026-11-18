@@ -272,7 +272,11 @@ trigger. The health check itself does not have to be switched on for triggers to
 
 Answers are read as JSON when they are JSON and as prose when they are not, and the reading
 is biased towards `OFF`: an ambiguous reply is never a match, because a trigger that fires
-on ambiguity is worse than no trigger at all. Unless you set `append_answer_format: false`,
+on ambiguity is worse than no trigger at all. A prose reply counts as a match only when it
+*answers* the question — "yes", "affirmative", "confirmed" — never when it merely describes
+the frame, because a description says nothing about which of your triggers it answers: "a
+person is visible on the step" is not a fire. Those replies come out `unknown` and leave the
+boolean where it was. Unless you set `append_answer_format: false`,
 your prompt has a short instruction appended asking for
 `{"match": true, "explanation": "…"}`, so you can write the question and nothing else.
 
