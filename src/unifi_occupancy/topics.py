@@ -39,5 +39,35 @@ def health_topic(mqtt: MqttConfig, camera: Camera) -> str:
     return f"{camera_base(mqtt, camera)}/health"
 
 
+def trigger_topic(mqtt: MqttConfig, camera: Camera, key: str) -> str:
+    """Where one custom trigger's boolean lives for one camera.
+
+    Nested under ``trigger/`` rather than sitting beside ``motion`` and
+    ``smoke``: a trigger is named by whoever wrote it, and a trigger called
+    "motion" must not be able to overwrite the detection of the same name.
+    """
+    return f"{camera_base(mqtt, camera)}/trigger/{key}"
+
+
+def trigger_attributes_topic(mqtt: MqttConfig, camera: Camera, key: str) -> str:
+    """The JSON behind that boolean: the explanation, the model, the time."""
+    return f"{trigger_topic(mqtt, camera, key)}/attributes"
+
+
+def trigger_snapshot_topic(mqtt: MqttConfig, camera: Camera, key: str) -> str:
+    """The frame that matched, for a trigger that opted into publishing one.
+
+    The only topic in this service carrying something other than a boolean, a
+    number or a sentence, and the only one published **unretained**: a frame of
+    a doorway is likely to show a face, and a retained one would sit on the
+    broker until something overwrote it. Unretained means a subscriber who was
+    listening gets it and nobody else does, which is the right trade for an
+    image: Home Assistant holds it as long as the entity lives, an automation
+    firing on the boolean can attach it to a notification, and nothing is left
+    behind for whoever reads the broker next month.
+    """
+    return f"{trigger_topic(mqtt, camera, key)}/snapshot"
+
+
 def payload_for(value: bool) -> str:
     return PAYLOAD_ON if value else PAYLOAD_OFF

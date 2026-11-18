@@ -17,6 +17,7 @@ from .config import (
     ConfigError,
     ReportConfig,
     load_config,
+    load_file_config,
     load_report_config,
 )
 from .report import SheetWriter
@@ -77,7 +78,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         config = load_config()
-        config = replace(config, reports=load_report_config(config.config_file))
+        from_file = load_file_config(config.config_file, vision=config.vision)
+        config = replace(config, reports=from_file.reports, triggers=from_file.triggers)
     except ConfigError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
         return 2
