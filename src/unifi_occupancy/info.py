@@ -92,6 +92,12 @@ def service_info_payload(
             "occupancy_sheets": config.reports is not None and config.reports.enabled,
             "camera_health": config.health.enabled,
             "custom_triggers": bool(config.active_triggers),
+            # Its own flag because it is the one setting that makes this
+            # service publish a picture. Anyone auditing what reaches the
+            # broker should be able to read it off the info topic.
+            "trigger_snapshots": any(
+                trigger.publish_snapshot for trigger in config.active_triggers
+            ),
             "metrics": config.metrics.enabled,
         },
         "detections": list(DETECTION_KEYS),
@@ -110,6 +116,7 @@ def service_info_payload(
                 "cameras": "all" if trigger.all_cameras else list(trigger.cameras),
                 "interval_minutes": trigger.interval_minutes,
                 "model": trigger.model,
+                "publish_snapshot": trigger.publish_snapshot,
             }
             for trigger in config.active_triggers
         ]

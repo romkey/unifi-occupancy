@@ -54,5 +54,20 @@ def trigger_attributes_topic(mqtt: MqttConfig, camera: Camera, key: str) -> str:
     return f"{trigger_topic(mqtt, camera, key)}/attributes"
 
 
+def trigger_snapshot_topic(mqtt: MqttConfig, camera: Camera, key: str) -> str:
+    """The frame that matched, for a trigger that opted into publishing one.
+
+    The only topic in this service carrying something other than a boolean, a
+    number or a sentence, and the only one published **unretained**: a frame of
+    a doorway is likely to show a face, and a retained one would sit on the
+    broker until something overwrote it. Unretained means a subscriber who was
+    listening gets it and nobody else does, which is the right trade for an
+    image: Home Assistant holds it as long as the entity lives, an automation
+    firing on the boolean can attach it to a notification, and nothing is left
+    behind for whoever reads the broker next month.
+    """
+    return f"{trigger_topic(mqtt, camera, key)}/snapshot"
+
+
 def payload_for(value: bool) -> str:
     return PAYLOAD_ON if value else PAYLOAD_OFF

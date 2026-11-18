@@ -99,6 +99,15 @@ def _escape_label(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
+def _payload_bytes(payload: str | bytes | None) -> int:
+    """How much went over the wire. Bytes stay bytes; text is encoded first."""
+    if not payload:
+        return 0
+    if isinstance(payload, bytes):
+        return len(payload)
+    return len(payload.encode("utf-8"))
+
+
 def format_value(value: float) -> str:
     """A number the way the exposition format wants it."""
     if math.isnan(value):
@@ -595,6 +604,12 @@ class Metrics:
             "Unix time at which each trigger last checked each camera.",
             ("trigger", "camera"),
         )
+        self.trigger_snapshots = registry.counter(
+            "trigger_snapshots_total",
+            "Matching frames published, by trigger and camera. Only triggers "
+            "with publish_snapshot on can ever increment this.",
+            ("trigger", "camera"),
+        )
 
         # -- the occupancy history and sheets --------------------------------
         self.recorded_edges = registry.counter(
@@ -662,6 +677,13 @@ class Metrics:
         )
         self.feature_enabled.set(float(config.health.enabled), feature="camera_health")
         self.feature_enabled.set(float(bool(config.active_triggers)), feature="custom_triggers")
+        # Worth its own series: this is the one setting that makes the service
+        # publish an image, so "is anything sending frames to the broker right
+        # now" should be answerable without reading config.yaml.
+        self.feature_enabled.set(
+            float(any(trigger.publish_snapshot for trigger in config.active_triggers)),
+            feature="trigger_snapshots",
+        )
         self.feature_enabled.set(float(config.metrics.enabled), feature="metrics")
         self.configured_seconds.set(config.protect.poll_interval, setting="poll_interval")
         self.configured_seconds.set(config.detection_hold_seconds, setting="detection_hold")
@@ -832,6 +854,7 @@ class Metrics:
             self.trigger_checks,
             self.trigger_state,
             self.trigger_last_check,
+            self.trigger_snapshots,
         )
         for slug in slugs:
             for metric in per_camera:
@@ -841,10 +864,12 @@ class Metrics:
 
     # -- MQTT ----------------------------------------------------------------
 
-    def record_publish(self, payload: str | None, *, outcome: str = OUTCOME_SUCCESS) -> None:
+    def record_publish(
+        self, payload: str | bytes | None, *, outcome: str = OUTCOME_SUCCESS
+    ) -> None:
         self.mqtt_publishes.inc(outcome=outcome)
         if outcome == OUTCOME_SUCCESS:
-            self.mqtt_published_bytes.inc(len(payload.encode("utf-8")) if payload else 0)
+            self.mqtt_published_bytes.inc(_payload_bytes(payload))
             self.mqtt_last_publish.set(self._wall())
 
     def record_publish_suppressed(self) -> None:
@@ -873,6 +898,10 @@ class Metrics:
             self.trigger_state.set(
                 float(state == answer), trigger=trigger, camera=slug, state=state
             )
+
+    def record_trigger_snapshot(self, trigger: str, camera: Camera) -> None:
+        """One matching frame went to the broker."""
+        self.trigger_snapshots.inc(trigger=trigger, camera=camera.slug)
 
     # -- history and sheets --------------------------------------------------
 

@@ -15,10 +15,17 @@ binary sensor per camera per trigger, and an automation can act on a fire at the
 front door the same way it acts on motion.
 
 The same cautions as the camera health check apply, and for the same reason:
-this is one of the two features that touches an image. A snapshot exists in
-memory for the length of one request, goes to the configured endpoint and
-nowhere else, and is never published, logged or written to disk. What reaches
-MQTT is a boolean and, at worst, a short sentence.
+this is one of the two features that touches an image. By default a snapshot
+exists in memory for the length of one request, goes to the configured endpoint
+and nowhere else, and is never published, logged or written to disk -- what
+reaches MQTT is a boolean and, at worst, a short sentence.
+
+One trigger at a time can opt out of that last part. ``publish_snapshot: true``
+puts the frame that matched on ``<prefix>/<camera>/trigger/<name>/snapshot`` so
+a notification can carry the picture of the fire, which is a great deal more
+use than the word "ON". It is off by default, there is no way to switch it on
+globally, and the frame is published unretained so it does not outlive the
+match. Nothing is written to disk on any path.
 """
 
 from __future__ import annotations
@@ -265,7 +272,9 @@ class Snapshots(Protocol):
 class TriggerSink(Protocol):
     """Where answers go -- :class:`~unifi_occupancy.publisher.StatePublisher`."""
 
-    async def publish_trigger(self, camera: Camera, result: TriggerResult) -> None: ...
+    async def publish_trigger(
+        self, camera: Camera, result: TriggerResult, snapshot: bytes | None = ...
+    ) -> None: ...
 
 
 class TriggerWatcher:
@@ -330,32 +339,48 @@ class TriggerWatcher:
 
     async def check(self, camera: Camera) -> TriggerResult:
         """One camera: snapshot, ask, answer, and how long all that took."""
+        result, _ = await self.check_frame(camera)
+        return result
+
+    async def check_frame(self, camera: Camera) -> tuple[TriggerResult, bytes | None]:
+        """:meth:`check`, plus the frame -- but only if it is to be published.
+
+        The frame comes back only when this trigger has ``publish_snapshot``
+        on *and* the answer was a match. Every other path returns ``None``, so
+        a trigger that was never asked to publish an image cannot accidentally
+        hand one to a caller: the bytes go out of scope when this returns.
+        """
         started = self._clock()
-        result = await self._check(camera)
+        result, image = await self._check(camera)
         self._metrics.record_trigger_check(
             self._config.key, camera, result.status, max(0.0, self._clock() - started)
         )
-        return result
+        if image is not None and self._config.publish_snapshot and result.matched:
+            return result, image
+        return result, None
 
-    async def _check(self, camera: Camera) -> TriggerResult:
+    async def _check(self, camera: Camera) -> tuple[TriggerResult, bytes | None]:
         """One camera: snapshot, ask, answer. Never raises."""
         if not camera.connected:
-            return self._result(UNKNOWN, "camera is not connected", None)
+            return self._result(UNKNOWN, "camera is not connected", None), None
         try:
             image = await self._snapshots.get_snapshot(
                 camera.id, high_quality=self._config.high_quality_snapshot
             )
         except Exception as exc:  # noqa: BLE001 - a bad snapshot is an answer, not a crash
             logger.warning("no snapshot for %s: %s", camera.name, exc)
-            return self._result(UNKNOWN, tidy(f"could not take a snapshot: {exc}", 200), None)
+            return self._result(UNKNOWN, tidy(f"could not take a snapshot: {exc}", 200), None), None
         if not image:
-            return self._result(UNKNOWN, "the controller returned no snapshot", None)
+            return self._result(UNKNOWN, "the controller returned no snapshot", None), None
 
         try:
             answer = await self._judge.evaluate(image)
         except Exception as exc:  # noqa: BLE001 - likewise for the model
             logger.warning("trigger %s on %s failed: %s", self._config.name, camera.name, exc)
-            return self._result(UNKNOWN, tidy(str(exc), self._config.max_explanation_chars), None)
+            return (
+                self._result(UNKNOWN, tidy(str(exc), self._config.max_explanation_chars), None),
+                None,
+            )
 
         if answer.status == MATCH:
             logger.warning(
@@ -366,7 +391,7 @@ class TriggerWatcher:
             )
         else:
             logger.info("%s on %s: %s", self._config.name, camera.name, answer.status)
-        return self._result(answer.status, answer.explanation, answer.model)
+        return self._result(answer.status, answer.explanation, answer.model), image
 
     async def sweep(self, cameras: Sequence[Camera]) -> list[TriggerResult]:
         """Ask about every camera this trigger watches, trickled not burst."""
@@ -377,12 +402,12 @@ class TriggerWatcher:
             if not self._still_there(camera):
                 logger.debug("%s went away before its %s check", camera.name, self._config.name)
                 continue
-            result = await self.check(camera)
+            result, image = await self.check_frame(camera)
             if not self._still_there(camera):
                 logger.debug("%s went away during its %s check", camera.name, self._config.name)
                 continue
             results.append(result)
-            await self._sink.publish_trigger(camera, result)
+            await self._sink.publish_trigger(camera, result, image)
         return results
 
     async def run_forever(self, cameras: Callable[[], Sequence[Camera]]) -> None:

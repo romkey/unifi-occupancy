@@ -247,6 +247,17 @@ class TriggerConfig:
     stagger_seconds: float = 5.0
     high_quality_snapshot: bool = False
     max_explanation_chars: int = 200
+    #: Whether a matching frame is published alongside the boolean.
+    #:
+    #: Off by default, and deliberately per-trigger only: there is no env var
+    #: and no inherited default for this one, because it is the only thing the
+    #: service publishes that is not a boolean or a sentence, and nobody should
+    #: be able to switch it on for every trigger at once by setting one
+    #: variable. A published frame is the single most sensitive thing here --
+    #: it is likely to show a face -- so saying yes has to be a decision taken
+    #: once per question you ask. See :mod:`unifi_occupancy.topics` for what it
+    #: costs on the broker.
+    publish_snapshot: bool = False
     #: Home Assistant ``device_class`` for the binary sensor, e.g. ``problem``,
     #: ``smoke``, ``safety``. ``None`` leaves the entity classless.
     device_class: str | None = None
@@ -608,6 +619,7 @@ def _parse_triggers(raw: object, defaults: VisionConfig) -> tuple[TriggerConfig,
                     minimum=20,
                     maximum=2_000,
                 ),
+                publish_snapshot=_yaml_bool(entry, "publish_snapshot", False, where),
                 device_class=_yaml_optional_str(entry, "device_class", None, where),
                 append_answer_format=_yaml_bool(entry, "append_answer_format", True, where),
             )

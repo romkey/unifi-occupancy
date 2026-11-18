@@ -20,6 +20,7 @@ from .discovery import (
     removal_messages,
     service_messages,
     trigger_messages,
+    trigger_snapshot_messages,
     triggers_for,
 )
 from .health import HealthVerdict
@@ -38,6 +39,7 @@ from .topics import (
     payload_for,
     service_info_topic,
     trigger_attributes_topic,
+    trigger_snapshot_topic,
     trigger_topic,
 )
 from .triggers import TriggerResult
@@ -46,9 +48,15 @@ logger = logging.getLogger(__name__)
 
 
 class Transport(Protocol):
-    """Anything that can put a payload on a topic."""
+    """Anything that can put a payload on a topic.
 
-    async def publish(self, topic: str, payload: str | None, *, retain: bool, qos: int) -> None: ...
+    ``bytes`` is only ever a snapshot from a trigger that opted into publishing
+    one; everything else this service sends is text or an empty payload.
+    """
+
+    async def publish(
+        self, topic: str, payload: str | bytes | None, *, retain: bool, qos: int
+    ) -> None: ...
 
 
 class StatePublisher:
@@ -85,6 +93,24 @@ class StatePublisher:
             raise
         self._metrics.record_publish(payload, outcome=OUTCOME_SUCCESS)
         self._published[topic] = payload
+
+    async def _send_snapshot(self, topic: str, image: bytes) -> None:
+        """Put one frame on the broker, unretained and unremembered.
+
+        Deliberately not :meth:`_send`: that keeps every payload it sends in
+        ``_published`` so it can suppress repeats, and holding a megabyte of
+        doorway per camera per trigger for the life of the process is exactly
+        what the rest of this service promises not to do. Nothing is cached,
+        nothing is compared, and ``retain=False`` is passed explicitly rather
+        than taken from the config -- a retained frame would outlive the match
+        it belongs to, and no MQTT setting should be able to turn that on.
+        """
+        try:
+            await self._transport.publish(topic, image, retain=False, qos=self._config.mqtt.qos)
+        except Exception:
+            self._metrics.record_publish(None, outcome=OUTCOME_ERROR)
+            raise
+        self._metrics.record_publish(image, outcome=OUTCOME_SUCCESS)
 
     async def publish_availability(self, online: bool) -> None:
         await self._send(
@@ -165,16 +191,22 @@ class StatePublisher:
             return
         self._triggers_cleared.add(camera.id)
         for trigger in triggers_for(self._config, camera):
-            if trigger.enabled:
-                continue
-            if self._config.discovery.enabled:
-                for message in trigger_messages(self._config, camera, trigger):
+            if not trigger.enabled:
+                if self._config.discovery.enabled:
+                    for message in trigger_messages(self._config, camera, trigger):
+                        await self._send(message.topic, None, force=True)
+                for topic in (
+                    trigger_topic(self._config.mqtt, camera, trigger.key),
+                    trigger_attributes_topic(self._config.mqtt, camera, trigger.key),
+                ):
+                    await self._send(topic, None, force=True)
+            if not trigger.publish_snapshot and self._config.discovery.enabled:
+                # Someone turned `publish_snapshot` back off. The frame itself
+                # was never retained so there is nothing to clear there, but the
+                # camera entity's config was, and Home Assistant would go on
+                # showing the last match it received.
+                for message in trigger_snapshot_messages(self._config, camera, trigger):
                     await self._send(message.topic, None, force=True)
-            for topic in (
-                trigger_topic(self._config.mqtt, camera, trigger.key),
-                trigger_attributes_topic(self._config.mqtt, camera, trigger.key),
-            ):
-                await self._send(topic, None, force=True)
 
     async def retract(self, cameras: Iterable[Camera]) -> None:
         """Remove cameras from HA and forget their published state."""
@@ -239,7 +271,9 @@ class StatePublisher:
             force=True,
         )
 
-    async def publish_trigger(self, camera: Camera, result: TriggerResult) -> None:
+    async def publish_trigger(
+        self, camera: Camera, result: TriggerResult, snapshot: bytes | None = None
+    ) -> None:
         """Publish one trigger's answer about one camera.
 
         An ``unknown`` answer -- no snapshot, no endpoint, a reply nobody could
@@ -247,7 +281,17 @@ class StatePublisher:
         because the model could not be reached would be a lie, and a trigger
         whose whole job is to notice a fire must not quietly say "no fire"
         when what it means is "I could not look".
+
+        ``snapshot`` is the frame that matched, and arrives only from a trigger
+        configured to publish one. It goes out before the boolean so that an
+        automation firing on the boolean finds the image already there.
         """
+        if snapshot and result.matched:
+            await self._send_snapshot(
+                trigger_snapshot_topic(self._config.mqtt, camera, result.trigger),
+                snapshot,
+            )
+            self._metrics.record_trigger_snapshot(result.trigger, camera)
         if result.known:
             await self._send(
                 trigger_topic(self._config.mqtt, camera, result.trigger),
@@ -273,7 +317,9 @@ class AiomqttTransport:
     def __init__(self, client: object) -> None:
         self._client = client
 
-    async def publish(self, topic: str, payload: str | None, *, retain: bool, qos: int) -> None:
+    async def publish(
+        self, topic: str, payload: str | bytes | None, *, retain: bool, qos: int
+    ) -> None:
         await self._client.publish(  # type: ignore[attr-defined]
             topic,
             payload=payload if payload is not None else b"",

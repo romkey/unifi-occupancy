@@ -63,6 +63,7 @@ unifi-occupancy/<camera>/info                 {"mac": "...", "firmware": "...", 
 unifi-occupancy/<camera>/health               {"health": "good"}   (opt-in)
 unifi-occupancy/<camera>/trigger/<name>       ON | OFF             (opt-in)
 unifi-occupancy/<camera>/trigger/<name>/attributes   {"state": "match", ...}
+unifi-occupancy/<camera>/trigger/<name>/snapshot     <JPEG bytes>    (opt-in, unretained)
 ```
 
 `<camera>` is the camera's Protect name, lowercased with non-alphanumerics collapsed to
@@ -238,6 +239,7 @@ unifi-occupancy/front_door/trigger/fire/attributes  {"state": "match", "name": "
                                                      "match": true,
                                                      "explanation": "flames on the doormat",
                                                      "model": "qwen2.5-vl", "checked_at": "..."}
+unifi-occupancy/front_door/trigger/fire/snapshot    <JPEG bytes>   (opt-in, unretained)
 ```
 
 `ON` means the model could see what you described the last time it looked, `OFF` means it
@@ -258,6 +260,7 @@ Each trigger takes:
 | `model` | the health check's | Model to ask; must be able to see images |
 | `api_base_url` | the health check's | OpenAI-compatible endpoint for this trigger |
 | `api_key` | the health check's | Optional; local servers need none |
+| `publish_snapshot` | `false` | Publish the frame that matched. Opt-in, per trigger — see below |
 | `device_class` | unset | Home Assistant device class: `problem`, `smoke`, `safety`, … |
 | `high_quality_snapshot` | `false` | Full-resolution snapshots for this trigger |
 | `request_timeout` | `60` | Vision request timeout, seconds |
@@ -284,12 +287,79 @@ A trigger renamed or deleted outright leaves its last retained topics on the bro
 nothing is left to say they existed. Setting `enabled: false` instead retracts them
 properly — the entity, the boolean and its attributes — and is the way to switch one off.
 
+### Publishing the frame that matched
+
+"There is a fire at the front door" is a great deal more use with the picture attached. Set
+`publish_snapshot: true` on a trigger and the frame that matched goes to
+`<prefix>/<camera>/trigger/<name>/snapshot` as raw JPEG bytes, alongside the boolean.
+
+This is the only thing the service publishes that is not a boolean, a number or a sentence,
+so it is **off by default and switched on one trigger at a time**. There is deliberately no
+environment variable and no inherited default for it: every other endpoint setting can be
+set once and inherited by every trigger, but nobody should be able to start publishing
+pictures of their doorways by setting a single variable. Before you turn it on:
+
+- A frame of a doorway is likely to show a face, and quite possibly a crime. Everyone who
+  can read your broker can read it — usually a wider set of people than those who can open
+  Protect.
+- It is published **unretained**, so a subscriber who is listening gets it and nobody else
+  does. It is not left sitting on the broker for whoever looks next month, and it does not
+  outlive the match. Home Assistant holds the last one for as long as the entity exists.
+- Only a `match` publishes a frame. `clear` and `unknown` publish nothing, so an endpoint
+  that is down does not fill the broker with pictures.
+- Nothing is written to disk on any path, with this on or off.
+- A high-quality snapshot can run to a megabyte or two. Brokers have message size limits
+  (mosquitto's default `message_size_limit` is unlimited, but check yours) and some log
+  every publish.
+- `unifi-occupancy/info` reports `features.trigger_snapshots` and a `publish_snapshot` flag
+  per trigger, `feature_enabled{feature="trigger_snapshots"}` says the same in Prometheus,
+  and the service logs a line per trigger at startup. You should always be able to find out
+  whether anything is publishing pictures without reading `config.yaml`.
+
+Turning it back off retracts the camera entity on the next poll. The frames themselves were
+never retained, so there is nothing to clear.
+
 ### Home Assistant
 
-Each trigger becomes one binary sensor per camera it watches, named after the trigger and
-sitting on that camera's device, with the explanation, the model and the check time as
-attributes. Give it a `device_class` and it looks like what it is: `problem` for a fire,
-`safety`, `smoke`, `door`, whatever fits. Automate on it exactly as you would on motion.
+Each trigger gets two entities per camera it watches, and a third if it publishes frames —
+all of them on that camera's existing device, next to its detections:
+
+| Entity | What it is |
+| --- | --- |
+| `binary_sensor.<camera>_<trigger>` | The boolean. `ON` when the model could see it. Automate on this one |
+| `sensor.<camera>_<trigger>_status` | The last answer as a word: `match`, `clear` or `unknown` — diagnostic |
+| `camera.<camera>_<trigger>_snapshot` | The frame that matched. Only with `publish_snapshot: true` — diagnostic |
+
+The binary sensor carries the explanation, the model and the check time as attributes. Give
+it a `device_class` and it looks like what it is: `problem` for a fire, `safety`, `smoke`,
+`door`, whatever fits. Automate on it exactly as you would on motion.
+
+The status sensor is there because the boolean structurally cannot say `unknown` — an
+unanswerable check leaves it alone, so `OFF` means both "no fire" and "no fire as far as I
+know". Condition on the status sensor when the difference matters:
+
+```yaml
+automation:
+  - alias: Fire at the front door
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.front_door_fire
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: sensor.front_door_fire_status
+        state: match
+    action:
+      - service: notify.mobile_app_phone
+        data:
+          title: Fire at the front door
+          message: "{{ state_attr('binary_sensor.front_door_fire', 'explanation') }}"
+          data:
+            image: /api/camera_proxy/camera.front_door_fire_snapshot
+```
+
+The camera entity has no image until the first match, since its topic is unretained — Home
+Assistant shows it as unknown until then, which is correct rather than a fault.
 
 ### What it costs
 
@@ -515,6 +585,7 @@ prefixed `unifi_occupancy_`; the table leaves that off to stay readable.
 | `job_runs_total{job,outcome}`, `job_duration_seconds{job}`, `job_in_progress{job}`, `job_last_success_timestamp_seconds{job}` | The background jobs — `poll`, `events`, `health_sweep`, `sheets` and one `trigger:<name>` per custom trigger — their outcomes, durations and last success |
 | `health_checks_total{camera,verdict}`, `health_check_duration_seconds`, `camera_health{camera,status}`, `health_last_check_timestamp_seconds{camera}` | The optional vision check: verdicts per camera, how long each took, when each was last looked at |
 | `trigger_checks_total{trigger,camera,answer}`, `trigger_check_duration_seconds{trigger}`, `trigger_state{trigger,camera,state}`, `trigger_last_check_timestamp_seconds{trigger,camera}` | Custom triggers: answers per trigger and camera, how long each check took, when each was last asked |
+| `trigger_snapshots_total{trigger,camera}` | Matching frames published to the broker. Stays absent unless a trigger has `publish_snapshot` on |
 | `recorded_edges_total{kind,edge}`, `recorder_failures_total{operation}`, `sheets_written_total` | The history database and the daily sheets |
 | `http_requests_total{path,status}`, `http_request_duration_seconds` | This endpoint itself |
 | `process_cpu_seconds_total`, `process_max_resident_bytes`, `asyncio_tasks` | What the process is costing |
@@ -715,8 +786,15 @@ controller and no broker.
 - The snapshot endpoint is called only by the two vision features — the health check with
   `CAMERA_HEALTH_ENABLED=true`, and any trigger you write in `config.yaml`. One frame per
   camera per interval, sent to the endpoint you configured, held in memory for the length of
-  that one request, and never published to MQTT, written to disk or logged. Leave the
-  variable unset and write no triggers, and no snapshot is ever taken.
+  that one request. Leave the variable unset and write no triggers, and no snapshot is ever
+  taken.
+- No frame is ever written to disk or logged, on any path or setting.
+- One setting publishes a frame to MQTT: `publish_snapshot: true` on an individual trigger,
+  which sends the frame that *matched* to `trigger/<name>/snapshot`, unretained. It is off
+  by default, it cannot be switched on globally, and `features.trigger_snapshots` in the
+  `info` topic tells you whether anything has it on. Everything else this service publishes
+  is a boolean, a number or a short sentence. See
+  [Publishing the frame that matched](#publishing-the-frame-that-matched).
 - Published attributes are limited to camera id, name, model, hardware, connection state,
   last motion time and which detections the hardware supports.
 - The `info` topics add the console's name, type, version and uptime, and each camera's MAC,

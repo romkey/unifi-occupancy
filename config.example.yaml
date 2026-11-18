@@ -84,7 +84,8 @@ groups:
 #
 # This is one of the two features that reads a picture: with a trigger written
 # here, snapshots leave the process for the endpoint below. They are held in
-# memory for one request and are never published, logged or written to disk.
+# memory for one request and are never logged or written to disk. They are not
+# published either, unless a trigger sets publish_snapshot (see Fire below).
 # Delete this whole block and no snapshot is ever taken.
 #
 # The endpoint, key and model default to the camera health check's
@@ -107,6 +108,14 @@ groups:
 #     # Home Assistant device class for the binary sensor: problem, smoke,
 #     # safety, door, ... Leave it out for a classless sensor.
 #     device_class: problem
+#     # Publish the frame that matched to trigger/fire/snapshot, so a
+#     # notification can carry the picture of the fire rather than the word
+#     # "ON". Off by default, and on purpose there is no way to switch it on
+#     # for every trigger at once: a frame of a doorway probably shows a face,
+#     # and everyone who can read your broker can read it. Published
+#     # unretained, so it does not sit there after the match, and only ever on
+#     # a match -- never on a clear or an unanswerable check.
+#     publish_snapshot: true
 #
 #   - name: Gate left open
 #     prompt: Is the driveway gate standing open?

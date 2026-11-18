@@ -21,19 +21,28 @@ class FakeTransport:
     """Records everything published so tests can assert on the wire format."""
 
     def __init__(self) -> None:
-        self.messages: list[tuple[str, str | None, bool, int]] = []
+        self.messages: list[tuple[str, str | bytes | None, bool, int]] = []
 
-    async def publish(self, topic: str, payload: str | None, *, retain: bool, qos: int) -> None:
+    async def publish(
+        self, topic: str, payload: str | bytes | None, *, retain: bool, qos: int
+    ) -> None:
         self.messages.append((topic, payload, retain, qos))
 
     @property
     def topics(self) -> list[str]:
         return [topic for topic, _, _, _ in self.messages]
 
-    def payload_for(self, topic: str) -> str | None:
+    def payload_for(self, topic: str) -> str | bytes | None:
         for candidate, payload, _, _ in reversed(self.messages):
             if candidate == topic:
                 return payload
+        raise KeyError(topic)
+
+    def retain_for(self, topic: str) -> bool:
+        """Whether the last publish to ``topic`` asked the broker to keep it."""
+        for candidate, _, retain, _ in reversed(self.messages):
+            if candidate == topic:
+                return retain
         raise KeyError(topic)
 
     def sent(self, topic: str) -> bool:

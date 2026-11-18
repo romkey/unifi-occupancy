@@ -91,9 +91,13 @@ class FakeJudge:
 class FakeSink:
     def __init__(self) -> None:
         self.published: list[tuple[str, TriggerResult]] = []
+        self.snapshots: list[tuple[str, str, bytes | None]] = []
 
-    async def publish_trigger(self, camera: Camera, result: TriggerResult) -> None:
+    async def publish_trigger(
+        self, camera: Camera, result: TriggerResult, snapshot: bytes | None = None
+    ) -> None:
         self.published.append((camera.name, result))
+        self.snapshots.append((camera.name, result.trigger, snapshot))
 
 
 def watcher_for(
@@ -671,5 +675,253 @@ def test_the_service_info_lists_the_triggers(config: Config) -> None:
             "cameras": "all",
             "interval_minutes": 5.0,
             "model": "some-vision-model",
+            "publish_snapshot": False,
         }
     ]
+
+
+# --------------------------------------------------------------------------- #
+# Publishing the frame that matched
+# --------------------------------------------------------------------------- #
+
+SNAPPY = replace(FIRE, publish_snapshot=True)
+
+
+def test_publishing_a_snapshot_is_off_unless_asked_for() -> None:
+    assert FIRE.publish_snapshot is False
+    assert TriggerConfig(name="X", prompt="y").publish_snapshot is False
+
+    parsed = parse_file_config("""
+        triggers:
+          - name: Fire
+            prompt: Is there a fire?
+          - name: Parcel
+            prompt: Is there a parcel?
+            publish_snapshot: true
+        """).triggers
+
+    assert parsed[0].publish_snapshot is False
+    assert parsed[1].publish_snapshot is True
+
+
+def test_there_is_no_way_to_switch_snapshots_on_for_every_trigger_at_once() -> None:
+    """The asymmetry is deliberate -- see TriggerConfig.publish_snapshot."""
+    assert not hasattr(VisionConfig(), "publish_snapshot")
+
+    inherited = parse_file_config(
+        """
+        triggers:
+          - name: Fire
+            prompt: Is there a fire?
+        """,
+        vision=VisionConfig(model="inherited", high_quality_snapshot=True),
+    ).triggers[0]
+
+    # Everything else is inherited from the endpoint defaults; this is not.
+    assert inherited.model == "inherited"
+    assert inherited.high_quality_snapshot is True
+    assert inherited.publish_snapshot is False
+
+
+async def test_a_match_publishes_the_frame_when_the_trigger_asked_for_it() -> None:
+    snapshots = FakeSnapshots(IMAGE)
+    sink = FakeSink()
+    watcher = watcher_for(snapshots, FakeJudge(TriggerAnswer(MATCH, "flames")), sink, SNAPPY)
+
+    await watcher.sweep([CAMERA])
+
+    assert sink.snapshots == [(CAMERA.name, "fire", IMAGE)]
+
+
+@pytest.mark.parametrize("answer", [CLEAR, UNKNOWN])
+async def test_only_a_match_publishes_a_frame(answer: str) -> None:
+    snapshots = FakeSnapshots(IMAGE)
+    sink = FakeSink()
+    watcher = watcher_for(snapshots, FakeJudge(TriggerAnswer(answer)), sink, SNAPPY)
+
+    await watcher.sweep([CAMERA])
+
+    assert sink.snapshots == [(CAMERA.name, "fire", None)]
+
+
+async def test_a_trigger_that_did_not_ask_never_hands_over_the_frame() -> None:
+    snapshots = FakeSnapshots(IMAGE)
+    sink = FakeSink()
+    watcher = watcher_for(snapshots, FakeJudge(TriggerAnswer(MATCH, "flames")), sink, FIRE)
+
+    await watcher.sweep([CAMERA])
+
+    assert sink.snapshots == [(CAMERA.name, "fire", None)]
+    assert sink.published[0][1].matched is True
+
+
+async def test_the_frame_goes_out_unretained_and_before_the_boolean(
+    config: Config, transport: FakeTransport
+) -> None:
+    config = triggered_config(config, SNAPPY)
+    publisher = StatePublisher(config, transport)
+    result = TriggerResult(trigger="fire", name="Fire", status=MATCH, explanation="flames")
+
+    await publisher.publish_trigger(CAMERA, result, IMAGE)
+
+    snapshot = "unifi-occupancy/front_door/trigger/fire/snapshot"
+    assert transport.payload_for(snapshot) == IMAGE
+    # Unretained, whatever the broker settings say: a kept frame would outlive
+    # the match it belongs to.
+    assert transport.retain_for(snapshot) is False
+    assert config.mqtt.retain is True
+    # An automation firing on the boolean should find the image already there.
+    assert transport.topics.index(snapshot) < transport.topics.index(
+        "unifi-occupancy/front_door/trigger/fire"
+    )
+
+
+async def test_the_frame_is_not_kept_in_the_publishers_memory(
+    config: Config, transport: FakeTransport
+) -> None:
+    """A megabyte of doorway per camera per trigger, held for the process life."""
+    config = triggered_config(config, SNAPPY)
+    publisher = StatePublisher(config, transport)
+    result = TriggerResult(trigger="fire", name="Fire", status=MATCH)
+
+    await publisher.publish_trigger(CAMERA, result, IMAGE)
+
+    cached = publisher._published
+    assert "unifi-occupancy/front_door/trigger/fire/snapshot" not in cached
+    assert not any(isinstance(value, bytes) for value in cached.values())
+
+
+async def test_the_same_frame_is_published_again_rather_than_suppressed(
+    config: Config, transport: FakeTransport
+) -> None:
+    config = triggered_config(config, SNAPPY)
+    publisher = StatePublisher(config, transport)
+    result = TriggerResult(trigger="fire", name="Fire", status=MATCH)
+
+    await publisher.publish_trigger(CAMERA, result, IMAGE)
+    await publisher.publish_trigger(CAMERA, result, IMAGE)
+
+    snapshot = "unifi-occupancy/front_door/trigger/fire/snapshot"
+    assert transport.topics.count(snapshot) == 2
+
+
+async def test_a_snapshot_counts_towards_the_bytes_published(
+    config: Config, transport: FakeTransport
+) -> None:
+    config = triggered_config(config, SNAPPY)
+    metrics = Metrics()
+    publisher = StatePublisher(config, transport, metrics=metrics)
+
+    await publisher.publish_trigger(
+        CAMERA, TriggerResult(trigger="fire", name="Fire", status=MATCH), IMAGE
+    )
+
+    rendered = metrics.render()
+    assert 'unifi_occupancy_trigger_snapshots_total{trigger="fire",camera="front_door"} 1' in (
+        rendered
+    )
+    # The frame's own bytes are counted, not just the attributes JSON beside it.
+    published = next(
+        float(line.rsplit(" ", 1)[1])
+        for line in rendered.splitlines()
+        if line.startswith("unifi_occupancy_mqtt_published_bytes_total ")
+    )
+    assert published > len(IMAGE)
+
+
+# --------------------------------------------------------------------------- #
+# What Home Assistant is told
+# --------------------------------------------------------------------------- #
+
+
+def test_every_trigger_gets_a_status_sensor_that_can_say_unknown(config: Config) -> None:
+    config = triggered_config(config, FIRE)
+
+    topics = {message.topic: message.payload for message in discovery_messages(config, CAMERA)}
+    topic = "homeassistant/sensor/unifi_occupancy_front_door/trigger_fire_status/config"
+
+    assert topic in topics
+    payload = topics[topic]
+    assert payload is not None
+    assert payload["name"] == "Fire Status"
+    # Reads the attributes topic, which carries `unknown` -- the one thing the
+    # boolean structurally cannot report.
+    assert payload["state_topic"] == "unifi-occupancy/front_door/trigger/fire/attributes"
+    assert payload["value_template"] == "{{ value_json.state | default('unknown', true) }}"
+    assert payload["entity_category"] == "diagnostic"
+    assert payload["unique_id"] == "unifi_occupancy_cam-1_trigger_fire_status"
+
+
+def test_a_snapshot_trigger_gets_a_camera_entity(config: Config) -> None:
+    config = triggered_config(config, SNAPPY)
+
+    topics = {message.topic: message.payload for message in discovery_messages(config, CAMERA)}
+    topic = "homeassistant/camera/unifi_occupancy_front_door/trigger_fire_snapshot/config"
+
+    assert topic in topics
+    payload = topics[topic]
+    assert payload is not None
+    assert payload["name"] == "Fire Snapshot"
+    assert payload["topic"] == "unifi-occupancy/front_door/trigger/fire/snapshot"
+    assert payload["unique_id"] == "unifi_occupancy_cam-1_trigger_fire_snapshot"
+    assert payload["entity_category"] == "diagnostic"
+
+
+def test_no_camera_entity_without_the_setting(config: Config) -> None:
+    config = triggered_config(config, FIRE)
+
+    topics = [message.topic for message in discovery_messages(config, CAMERA)]
+
+    assert not any("trigger_fire_snapshot" in topic for topic in topics)
+
+
+def test_turning_snapshots_back_off_retracts_the_camera_entity(config: Config) -> None:
+    config = triggered_config(config, FIRE)
+
+    retracted = [message.topic for message in removal_messages(config, CAMERA)]
+    topic = "homeassistant/camera/unifi_occupancy_front_door/trigger_fire_snapshot/config"
+
+    assert topic in retracted
+
+
+async def test_a_trigger_that_stopped_publishing_frames_loses_its_entity(
+    config: Config, transport: FakeTransport
+) -> None:
+    config = triggered_config(config, FIRE)
+    publisher = StatePublisher(config, transport)
+
+    await publisher.publish_state(DetectionTracker().snapshot(CAMERA, 0.0))
+
+    topic = "homeassistant/camera/unifi_occupancy_front_door/trigger_fire_snapshot/config"
+    assert transport.payload_for(topic) is None
+    # The trigger itself is still on, so its own entities stay put.
+    binary = "homeassistant/binary_sensor/unifi_occupancy_front_door/trigger_fire/config"
+    assert transport.payload_for(binary) is not None
+
+
+def test_a_retracted_camera_takes_its_snapshot_entity_too(config: Config) -> None:
+    config = triggered_config(config, SNAPPY)
+
+    retracted = [message.topic for message in removal_messages(config, CAMERA)]
+
+    assert "homeassistant/camera/unifi_occupancy_front_door/trigger_fire_snapshot/config" in (
+        retracted
+    )
+
+
+def test_the_service_info_says_whether_anything_publishes_frames(config: Config) -> None:
+    assert (
+        service_info_payload(triggered_config(config, FIRE))["features"]["trigger_snapshots"]
+        is False
+    )
+    payload = service_info_payload(triggered_config(config, SNAPPY))
+    assert payload["features"]["trigger_snapshots"] is True
+    assert payload["triggers"][0]["publish_snapshot"] is True
+
+
+def test_a_switched_off_snapshot_trigger_does_not_count(config: Config) -> None:
+    config = triggered_config(config, replace(SNAPPY, enabled=False))
+
+    payload = service_info_payload(config)
+
+    assert payload["features"]["trigger_snapshots"] is False

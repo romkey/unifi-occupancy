@@ -307,6 +307,17 @@ async def _serve(
                 trigger.model,
                 trigger.base_url,
             )
+            if trigger.publish_snapshot:
+                # Said out loud at startup, on purpose: this is the one setting
+                # that puts a picture on the broker, and whoever reads the log
+                # should not have to go and find config.yaml to learn that.
+                logger.warning(
+                    "%r will publish the frame that matched to "
+                    "%s/<camera>/trigger/%s/snapshot (unretained)",
+                    trigger.name,
+                    config.mqtt.topic_prefix,
+                    trigger.key,
+                )
         if config.protect.use_websocket:
             tasks.append(asyncio.create_task(service.watch_events_forever(), name="events"))
         if store is not None and config.reports is not None:

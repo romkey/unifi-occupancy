@@ -30,6 +30,7 @@ from .topics import (
     info_topic,
     service_info_topic,
     trigger_attributes_topic,
+    trigger_snapshot_topic,
     trigger_topic,
 )
 
@@ -208,15 +209,28 @@ def triggers_for(config: Config, camera: Camera) -> tuple[TriggerConfig, ...]:
 def trigger_messages(
     config: Config, camera: Camera, trigger: TriggerConfig
 ) -> list[DiscoveryMessage]:
-    """The one binary sensor for a custom trigger on a camera.
+    """Everything Home Assistant gets for one custom trigger on one camera.
 
-    ``ON`` means the model could see what the trigger describes last time it
-    looked. The explanation, the model that answered and the time it answered
-    ride along as attributes, which is also where an ``unknown`` answer -- no
-    snapshot, no endpoint -- shows up, since those leave the boolean alone
-    rather than quietly reporting all-clear.
+    Two entities always, three when the trigger publishes frames:
+
+    * a **binary sensor** -- ``ON`` means the model could see what the trigger
+      describes last time it looked. This is the one automations fire on.
+    * a **diagnostic sensor** holding the last answer as a word: ``match``,
+      ``clear`` or ``unknown``, with the explanation, the model and the time as
+      attributes. It exists because the boolean structurally cannot say
+      ``unknown``: an unanswerable check leaves the boolean where it was, and
+      without this entity there would be nothing in Home Assistant showing the
+      difference between "the model says no" and "the model could not be
+      asked". A template condition on this sensor is how you keep an automation
+      from treating a broken vision server as an all-clear.
+    * a **camera entity** for the matching frame, only when
+      ``publish_snapshot`` is on. Its topic is unretained, so the entity has no
+      image until the first match -- Home Assistant shows it as unknown until
+      then, which is correct rather than a fault.
     """
     suffix = f"trigger_{trigger.key}"
+    state_topic = trigger_topic(config.mqtt, camera, trigger.key)
+    attributes = trigger_attributes_topic(config.mqtt, camera, trigger.key)
     payload: dict[str, Any] = {
         **_device(config, camera),
         "payload_on": PAYLOAD_ON,
@@ -224,12 +238,61 @@ def trigger_messages(
         "name": trigger.name,
         "unique_id": _unique_id(config, camera, suffix),
         "object_id": _object_id(config, camera, suffix),
-        "state_topic": trigger_topic(config.mqtt, camera, trigger.key),
-        "json_attributes_topic": trigger_attributes_topic(config.mqtt, camera, trigger.key),
+        "state_topic": state_topic,
+        "json_attributes_topic": attributes,
     }
     if trigger.device_class:
         payload["device_class"] = trigger.device_class
-    return [DiscoveryMessage(_config_topic(config, camera, suffix), payload)]
+    messages = [DiscoveryMessage(_config_topic(config, camera, suffix), payload)]
+
+    status_suffix = f"{suffix}_status"
+    messages.append(
+        DiscoveryMessage(
+            _config_topic(config, camera, status_suffix, "sensor"),
+            {
+                **_device(config, camera),
+                "name": f"{trigger.name} Status",
+                "unique_id": _unique_id(config, camera, status_suffix),
+                "object_id": _object_id(config, camera, status_suffix),
+                "state_topic": attributes,
+                "value_template": "{{ value_json.state | default('unknown', true) }}",
+                "json_attributes_topic": attributes,
+                "entity_category": "diagnostic",
+            },
+        )
+    )
+    if trigger.publish_snapshot:
+        messages.extend(trigger_snapshot_messages(config, camera, trigger))
+    return messages
+
+
+def trigger_snapshot_messages(
+    config: Config, camera: Camera, trigger: TriggerConfig
+) -> list[DiscoveryMessage]:
+    """The camera entity for a trigger's matching frame.
+
+    Built whether or not ``publish_snapshot`` is on, so it can be retracted:
+    turning the setting back off has to take the entity down, or Home Assistant
+    keeps showing a camera that will never get another frame -- and the frame it
+    is still showing is the last match, which is exactly the thing someone
+    turning the setting off wants gone.
+    """
+    suffix = f"trigger_{trigger.key}_snapshot"
+    return [
+        DiscoveryMessage(
+            _config_topic(config, camera, suffix, "camera"),
+            {
+                **_device(config, camera),
+                "name": f"{trigger.name} Snapshot",
+                "unique_id": _unique_id(config, camera, suffix),
+                "object_id": _object_id(config, camera, suffix),
+                # Raw JPEG bytes on the topic, which is what HA's MQTT camera
+                # expects when `image_encoding` is absent.
+                "topic": trigger_snapshot_topic(config.mqtt, camera, trigger.key),
+                "entity_category": "diagnostic",
+            },
+        )
+    ]
 
 
 def discovery_messages(config: Config, camera: Camera) -> list[DiscoveryMessage]:
@@ -302,6 +365,11 @@ def removal_messages(config: Config, camera: Camera) -> list[DiscoveryMessage]:
     for trigger in triggers_for(config, camera):
         if not trigger.enabled:
             messages.extend(trigger_messages(config, camera, trigger))
+        if not trigger.publish_snapshot:
+            # `trigger_messages` left this one out, and a retained camera
+            # config holding the last match it saw is the worst thing to leave
+            # behind for a camera that has gone away.
+            messages.extend(trigger_snapshot_messages(config, camera, trigger))
     return [DiscoveryMessage(message.topic, None) for message in messages]
 
 
