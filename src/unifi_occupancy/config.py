@@ -186,6 +186,111 @@ class HealthConfig:
 
 
 @dataclass(frozen=True)
+class VisionConfig:
+    """Where a vision model lives, for anything that wants to ask one.
+
+    The camera health check came first and brought its own ``CAMERA_HEALTH_*``
+    settings with it. Custom triggers ask the same kind of question of the same
+    kind of endpoint, so rather than a second set of credentials these default
+    to the health check's -- ``VISION_*`` overrides them when the two want
+    different models, and a trigger can override them again for itself.
+    """
+
+    base_url: str = "https://api.openai.com/v1"
+    api_key: str | None = None
+    model: str = "gpt-4o-mini"
+    request_timeout: float = 60.0
+    #: Seconds between one camera's check and the next within a sweep.
+    stagger_seconds: float = 5.0
+    high_quality_snapshot: bool = False
+    max_explanation_chars: int = 200
+
+
+#: Appended to every trigger prompt unless the trigger switches it off. The
+#: operator writes what to look for; this is what makes the answer readable.
+TRIGGER_ANSWER_FORMAT = (
+    "Answer only about what is visible in this frame, and answer no unless you can "
+    "actually see it.\n"
+    "\n"
+    'Reply with JSON and nothing else: {"match": true, "explanation": "<at most 15 '
+    'words>"} if it is present, or {"match": false} if it is not.'
+)
+
+DEFAULT_TRIGGER_INTERVAL_MINUTES = 15.0
+
+#: What to write under ``cameras:`` to mean every camera there is.
+ALL_CAMERAS: frozenset[str] = frozenset({"all", "*", "any", "every", "everything"})
+
+
+@dataclass(frozen=True)
+class TriggerConfig:
+    """One thing to watch the cameras for, in the operator's own words.
+
+    A name, a question, the cameras it applies to and how often to ask. The
+    answer becomes a boolean on ``<prefix>/<camera>/trigger/<name>``, so a
+    trigger is for something a frame can settle -- "is there a fire in this
+    doorway", "is the gate open", "is there a parcel on the step" -- not for
+    anything needing memory of what came before.
+    """
+
+    name: str
+    #: The question itself, as written. :attr:`question` is what is sent.
+    prompt: str
+    #: Camera names, slugs or Protect ids; empty means every camera.
+    cameras: tuple[str, ...] = ()
+    interval_minutes: float = DEFAULT_TRIGGER_INTERVAL_MINUTES
+    enabled: bool = True
+    base_url: str = "https://api.openai.com/v1"
+    api_key: str | None = None
+    model: str = "gpt-4o-mini"
+    request_timeout: float = 60.0
+    stagger_seconds: float = 5.0
+    high_quality_snapshot: bool = False
+    max_explanation_chars: int = 200
+    #: Home Assistant ``device_class`` for the binary sensor, e.g. ``problem``,
+    #: ``smoke``, ``safety``. ``None`` leaves the entity classless.
+    device_class: str | None = None
+    #: Whether to append :data:`TRIGGER_ANSWER_FORMAT` to the prompt.
+    append_answer_format: bool = True
+
+    @property
+    def key(self) -> str:
+        """The trigger's slug: its topic segment and its entity id."""
+        return slugify(self.name)
+
+    @property
+    def interval_seconds(self) -> float:
+        return self.interval_minutes * 60.0
+
+    @property
+    def all_cameras(self) -> bool:
+        return not self.cameras
+
+    @property
+    def question(self) -> str:
+        """The prompt as it goes to the model."""
+        if not self.append_answer_format:
+            return self.prompt
+        return f"{self.prompt.rstrip()}\n\n{TRIGGER_ANSWER_FORMAT}"
+
+    @property
+    def completions_url(self) -> str:
+        return f"{self.base_url.rstrip('/')}/chat/completions"
+
+    def selects(self, camera_id: str, camera_name: str) -> bool:
+        """Whether this trigger watches the named camera.
+
+        Matched the way camera groups are: by Protect id, by name, or by slug,
+        punctuation and case ignored -- so ``Front Door``, ``front_door`` and
+        the id all mean the same camera.
+        """
+        if self.all_cameras:
+            return True
+        aliases = {camera_id, slugify(camera_id), slugify(camera_name)}
+        return any({spec, slugify(spec)} & aliases for spec in self.cameras)
+
+
+@dataclass(frozen=True)
 class DiscoveryConfig:
     """Home Assistant MQTT autodiscovery settings."""
 
@@ -349,6 +454,28 @@ def _yaml_int(
     return value
 
 
+def _yaml_optional_str(
+    raw: Mapping[str, Any], key: str, default: str | None, where: str
+) -> str | None:
+    value = raw.get(key, default)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"{where}.{key} must be a non-empty string")
+    return value.strip()
+
+
+def _yaml_float(
+    raw: Mapping[str, Any], key: str, default: float, where: str, *, minimum: float
+) -> float:
+    value = raw.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ConfigError(f"{where}.{key} must be a number")
+    if value < minimum:
+        raise ConfigError(f"{where}.{key} must be at least {minimum}, got {value}")
+    return float(value)
+
+
 def _yaml_path(raw: Mapping[str, Any], key: str, default: Path, where: str) -> Path:
     value = raw.get(key)
     if value is None:
@@ -430,14 +557,98 @@ def _parse_groups(raw: object) -> tuple[CameraGroup, ...]:
     return tuple(groups)
 
 
-def parse_report_config(text: str, *, default_timezone: str = "UTC") -> ReportConfig:
-    """Parse the contents of ``config.yaml``."""
+def _parse_triggers(raw: object, defaults: VisionConfig) -> tuple[TriggerConfig, ...]:
+    """Parse the ``triggers:`` list. Absent or empty means no triggers."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ConfigError("triggers must be a list")
+    triggers: list[TriggerConfig] = []
+    for index, item in enumerate(raw):
+        where = f"triggers[{index}]"
+        entry = _yaml_mapping(item, where)
+        name = _yaml_str(entry, "name", "", where)
+        if not slugify(name) or slugify(name) == "camera":
+            raise ConfigError(f"{where}.name must contain a letter or a digit")
+        if "prompt" not in entry:
+            raise ConfigError(f"{where} needs a prompt saying what to look for")
+        base_url = _yaml_str(entry, "api_base_url", defaults.base_url, where)
+        if not base_url.startswith(("http://", "https://")):
+            raise ConfigError(f"{where}.api_base_url must be an http(s) URL, got {base_url!r}")
+        triggers.append(
+            TriggerConfig(
+                name=name,
+                prompt=_yaml_str(entry, "prompt", "", where),
+                cameras=_parse_trigger_cameras(entry.get("cameras"), where),
+                interval_minutes=_yaml_float(
+                    entry,
+                    "interval_minutes",
+                    DEFAULT_TRIGGER_INTERVAL_MINUTES,
+                    where,
+                    minimum=0.1,
+                ),
+                enabled=_yaml_bool(entry, "enabled", True, where),
+                base_url=base_url,
+                api_key=_yaml_optional_str(entry, "api_key", defaults.api_key, where),
+                model=_yaml_str(entry, "model", defaults.model, where),
+                request_timeout=_yaml_float(
+                    entry, "request_timeout", defaults.request_timeout, where, minimum=1.0
+                ),
+                stagger_seconds=_yaml_float(
+                    entry, "stagger_seconds", defaults.stagger_seconds, where, minimum=0.0
+                ),
+                high_quality_snapshot=_yaml_bool(
+                    entry, "high_quality_snapshot", defaults.high_quality_snapshot, where
+                ),
+                max_explanation_chars=_yaml_int(
+                    entry,
+                    "max_explanation_chars",
+                    defaults.max_explanation_chars,
+                    where,
+                    minimum=20,
+                    maximum=2_000,
+                ),
+                device_class=_yaml_optional_str(entry, "device_class", None, where),
+                append_answer_format=_yaml_bool(entry, "append_answer_format", True, where),
+            )
+        )
+    keys = [trigger.key for trigger in triggers]
+    duplicate = next((key for key in keys if keys.count(key) > 1), None)
+    if duplicate is not None:
+        raise ConfigError(f"two triggers resolve to the same name: {duplicate!r}")
+    return tuple(triggers)
+
+
+def _parse_trigger_cameras(raw: object, where: str) -> tuple[str, ...]:
+    """``cameras:`` -- a list, one name, or ALL (which is also the default)."""
+    if raw is None:
+        return ()
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list) or not raw:
+        raise ConfigError(f'{where}.cameras must be a list of camera names, or "ALL"')
+    members = [str(member).strip() for member in raw if str(member).strip()]
+    if any(member.lower() in ALL_CAMERAS for member in members):
+        return ()
+    if not members:
+        raise ConfigError(f'{where}.cameras must be a list of camera names, or "ALL"')
+    return tuple(members)
+
+
+def _document(text: str) -> Mapping[str, Any]:
     try:
         document = yaml.safe_load(text)
     except yaml.YAMLError as exc:
         raise ConfigError(f"config.yaml is not valid YAML: {exc}") from exc
+    return _yaml_mapping(document, "config.yaml")
 
-    root = _yaml_mapping(document, "config.yaml")
+
+def parse_report_config(text: str, *, default_timezone: str = "UTC") -> ReportConfig:
+    """Parse the ``reports:`` half of ``config.yaml``."""
+    return _report_config(_document(text), default_timezone)
+
+
+def _report_config(root: Mapping[str, Any], default_timezone: str) -> ReportConfig:
     reports = _yaml_mapping(root.get("reports"), "reports")
 
     timezone = _yaml_str(root, "timezone", default_timezone, "config.yaml")
@@ -471,21 +682,56 @@ def parse_report_config(text: str, *, default_timezone: str = "UTC") -> ReportCo
     )
 
 
+@dataclass(frozen=True)
+class FileConfig:
+    """Everything ``config.yaml`` says: the sheets, and the custom triggers.
+
+    ``reports`` is ``None`` only when there is no file at all, which is how the
+    sheets stay switched off for anyone who upgrades without asking for them.
+    """
+
+    reports: ReportConfig | None = None
+    triggers: tuple[TriggerConfig, ...] = ()
+
+
+def parse_file_config(
+    text: str,
+    *,
+    default_timezone: str = "UTC",
+    vision: VisionConfig | None = None,
+) -> FileConfig:
+    """Parse the whole of ``config.yaml``."""
+    root = _document(text)
+    return FileConfig(
+        reports=_report_config(root, default_timezone),
+        triggers=_parse_triggers(root.get("triggers"), vision or VisionConfig()),
+    )
+
+
+def load_file_config(
+    path: Path,
+    env: Mapping[str, str] | None = None,
+    vision: VisionConfig | None = None,
+) -> FileConfig:
+    """Read ``config.yaml``, or an empty :class:`FileConfig` if there is none."""
+    env = os.environ if env is None else env
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return FileConfig()
+    except OSError as exc:
+        raise ConfigError(f"could not read {path}: {exc}") from exc
+    return parse_file_config(text, default_timezone=_get(env, "TZ") or "UTC", vision=vision)
+
+
 def load_report_config(path: Path, env: Mapping[str, str] | None = None) -> ReportConfig | None:
-    """Read ``config.yaml``, or ``None`` when there is no such file.
+    """Read the ``reports:`` half of ``config.yaml``, or ``None`` if there is no file.
 
     No file means no sheets. That is how this stays switched off for anyone who
     upgrades without asking for it, and why the daily sheets are opt-in by
     creating the file rather than by setting yet another variable.
     """
-    env = os.environ if env is None else env
-    try:
-        text = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        raise ConfigError(f"could not read {path}: {exc}") from exc
-    return parse_report_config(text, default_timezone=_get(env, "TZ") or "UTC")
+    return load_file_config(path, env).reports
 
 
 @dataclass(frozen=True)
@@ -494,6 +740,8 @@ class Config:
     mqtt: MqttConfig
     discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
     health: HealthConfig = field(default_factory=HealthConfig)
+    #: Default endpoint for anything that asks a vision model a question.
+    vision: VisionConfig = field(default_factory=VisionConfig)
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
     log_level: str = "INFO"
     #: How long a smart detection stays "on" after the last event that reported it.
@@ -502,6 +750,13 @@ class Config:
     config_file: Path = DEFAULT_CONFIG_FILE
     #: Filled in from :func:`load_report_config`; ``None`` disables the sheets.
     reports: ReportConfig | None = None
+    #: Filled in from :func:`load_file_config`; empty means nothing to watch for.
+    triggers: tuple[TriggerConfig, ...] = ()
+
+    @property
+    def active_triggers(self) -> tuple[TriggerConfig, ...]:
+        """The triggers that are actually switched on."""
+        return tuple(trigger for trigger in self.triggers if trigger.enabled)
 
 
 def _health_config(env: Mapping[str, str]) -> HealthConfig:
@@ -528,6 +783,28 @@ def _health_config(env: Mapping[str, str]) -> HealthConfig:
         request_timeout=_get_positive_float(env, "CAMERA_HEALTH_REQUEST_TIMEOUT", 60.0),
         high_quality_snapshot=_get_bool(env, "CAMERA_HEALTH_HIGH_QUALITY_SNAPSHOT", False),
         max_explanation_chars=_get_int(env, "CAMERA_HEALTH_MAX_EXPLANATION_CHARS", 200),
+    )
+
+
+def _vision_config(env: Mapping[str, str], health: HealthConfig) -> VisionConfig:
+    """The default vision endpoint: ``VISION_*``, else the health check's own."""
+    # Not validated here: these are only defaults, and a half-finished setting
+    # left behind by someone trying the health check out must not stop the
+    # service from starting. A trigger that actually uses the endpoint checks
+    # it as it is parsed, where the feature is unambiguously on.
+    base_url = _get(env, "VISION_API_BASE_URL", health.base_url) or health.base_url
+    return VisionConfig(
+        base_url=base_url,
+        api_key=_get(env, "VISION_API_KEY", health.api_key),
+        model=_get(env, "VISION_MODEL", health.model) or health.model,
+        request_timeout=_get_positive_float(env, "VISION_REQUEST_TIMEOUT", health.request_timeout),
+        stagger_seconds=_get_float(env, "VISION_STAGGER_SECONDS", health.stagger_seconds),
+        high_quality_snapshot=_get_bool(
+            env, "VISION_HIGH_QUALITY_SNAPSHOT", health.high_quality_snapshot
+        ),
+        max_explanation_chars=_get_int(
+            env, "VISION_MAX_EXPLANATION_CHARS", health.max_explanation_chars
+        ),
     )
 
 
@@ -605,6 +882,7 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
     )
 
     health = _health_config(env)
+    vision = _vision_config(env, health)
     metrics = _metrics_config(env)
 
     return Config(
@@ -612,6 +890,7 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         mqtt=mqtt,
         discovery=discovery,
         health=health,
+        vision=vision,
         metrics=metrics,
         log_level=(_get(env, "LOG_LEVEL", "INFO") or "INFO").upper(),
         detection_hold_seconds=_get_positive_float(env, "DETECTION_HOLD_SECONDS", 30.0),

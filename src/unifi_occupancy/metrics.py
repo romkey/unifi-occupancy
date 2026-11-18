@@ -573,6 +573,29 @@ class Metrics:
             ("camera",),
         )
 
+        # -- custom triggers --------------------------------------------------
+        self.trigger_checks = registry.counter(
+            "trigger_checks_total",
+            "Custom trigger checks completed, by trigger, camera and answer.",
+            ("trigger", "camera", "answer"),
+        )
+        self.trigger_check_duration = registry.histogram(
+            "trigger_check_duration_seconds",
+            "How long one custom trigger check takes, snapshot and model together.",
+            ("trigger",),
+            buckets=JOB_BUCKETS,
+        )
+        self.trigger_state = registry.gauge(
+            "trigger_state",
+            "1 for each trigger's most recent answer about a camera, 0 for the others.",
+            ("trigger", "camera", "state"),
+        )
+        self.trigger_last_check = registry.gauge(
+            "trigger_last_check_timestamp_seconds",
+            "Unix time at which each trigger last checked each camera.",
+            ("trigger", "camera"),
+        )
+
         # -- the occupancy history and sheets --------------------------------
         self.recorded_edges = registry.counter(
             "recorded_edges_total",
@@ -638,6 +661,7 @@ class Metrics:
             float(reports is not None and reports.enabled), feature="occupancy_sheets"
         )
         self.feature_enabled.set(float(config.health.enabled), feature="camera_health")
+        self.feature_enabled.set(float(bool(config.active_triggers)), feature="custom_triggers")
         self.feature_enabled.set(float(config.metrics.enabled), feature="metrics")
         self.configured_seconds.set(config.protect.poll_interval, setting="poll_interval")
         self.configured_seconds.set(config.detection_hold_seconds, setting="detection_hold")
@@ -645,6 +669,17 @@ class Metrics:
         if reports is not None:
             self.configured_seconds.set(
                 reports.refresh_minutes * 60.0, setting="sheets_refresh_interval"
+            )
+        for trigger in config.active_triggers:
+            # Make each trigger's job series exist before its first sweep, the
+            # way JOBS does for the fixed ones: a trigger that has never
+            # managed to run should read as zero, not as absent.
+            job = f"trigger:{trigger.key}"
+            self.job_in_progress.set(0, job=job)
+            for outcome in (OUTCOME_SUCCESS, OUTCOME_ERROR):
+                self.job_runs.prime(job=job, outcome=outcome)
+            self.configured_seconds.set(
+                trigger.interval_seconds, setting=f"trigger_{trigger.key}_interval"
             )
 
     def describe_protect(
@@ -794,6 +829,9 @@ class Metrics:
             self.health_checks,
             self.camera_health,
             self.health_last_check,
+            self.trigger_checks,
+            self.trigger_state,
+            self.trigger_last_check,
         )
         for slug in slugs:
             for metric in per_camera:
@@ -821,6 +859,20 @@ class Metrics:
         self.health_last_check.set(self._wall(), camera=slug)
         for status in ("good", "bad", "unknown"):
             self.camera_health.set(float(status == verdict), camera=slug, status=status)
+
+    # -- custom triggers -----------------------------------------------------
+
+    def record_trigger_check(
+        self, trigger: str, camera: Camera, answer: str, seconds: float
+    ) -> None:
+        slug = camera.slug
+        self.trigger_checks.inc(trigger=trigger, camera=slug, answer=answer)
+        self.trigger_check_duration.observe(seconds, trigger=trigger)
+        self.trigger_last_check.set(self._wall(), trigger=trigger, camera=slug)
+        for state in ("match", "clear", "unknown"):
+            self.trigger_state.set(
+                float(state == answer), trigger=trigger, camera=slug, state=state
+            )
 
     # -- history and sheets --------------------------------------------------
 

@@ -19,6 +19,8 @@ from .discovery import (
     health_messages,
     removal_messages,
     service_messages,
+    trigger_messages,
+    triggers_for,
 )
 from .health import HealthVerdict
 from .info import camera_info_payload, service_info_payload
@@ -35,7 +37,10 @@ from .topics import (
     info_topic,
     payload_for,
     service_info_topic,
+    trigger_attributes_topic,
+    trigger_topic,
 )
+from .triggers import TriggerResult
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +64,8 @@ class StatePublisher:
         self._announced: set[str] = set()
         #: Cameras whose stale health topics we have already cleaned up.
         self._health_cleared: set[str] = set()
+        #: Cameras whose switched-off triggers we have already cleaned up.
+        self._triggers_cleared: set[str] = set()
         #: Whether the bridge device's own discovery has gone out this process.
         self._service_announced = False
 
@@ -144,6 +151,31 @@ class StatePublisher:
                 await self._send(message.topic, None, force=True)
         await self._send(health_topic(self._config.mqtt, camera), None, force=True)
 
+    async def _clear_disabled_triggers(self, camera: Camera) -> None:
+        """Take down the topics of triggers that are no longer switched on.
+
+        Same reasoning as :meth:`_clear_disabled_health`: a retained ``ON`` from
+        a trigger someone has since disabled would sit on the broker for good,
+        reporting a fire that was put out weeks ago. Only triggers still named
+        in ``config.yaml`` can be cleaned up this way -- a trigger deleted
+        outright, or renamed, leaves its old topics behind, so clear those by
+        hand or publish an empty payload to them.
+        """
+        if camera.id in self._triggers_cleared:
+            return
+        self._triggers_cleared.add(camera.id)
+        for trigger in triggers_for(self._config, camera):
+            if trigger.enabled:
+                continue
+            if self._config.discovery.enabled:
+                for message in trigger_messages(self._config, camera, trigger):
+                    await self._send(message.topic, None, force=True)
+            for topic in (
+                trigger_topic(self._config.mqtt, camera, trigger.key),
+                trigger_attributes_topic(self._config.mqtt, camera, trigger.key),
+            ):
+                await self._send(topic, None, force=True)
+
     async def retract(self, cameras: Iterable[Camera]) -> None:
         """Remove cameras from HA and forget their published state."""
         for camera in cameras:
@@ -153,14 +185,19 @@ class StatePublisher:
             # Clear the retained metadata too. These two describe a camera that
             # exists; left on the broker they would outlive it, and `info` is
             # meant to be an inventory of what is there now.
-            for topic in (
+            stale = [
                 info_topic(self._config.mqtt, camera),
                 attributes_topic(self._config.mqtt, camera),
                 health_topic(self._config.mqtt, camera),
-            ):
+            ]
+            for trigger in triggers_for(self._config, camera):
+                stale.append(trigger_topic(self._config.mqtt, camera, trigger.key))
+                stale.append(trigger_attributes_topic(self._config.mqtt, camera, trigger.key))
+            for topic in stale:
                 await self._send(topic, None, force=True)
             self._announced.discard(camera.id)
             self._health_cleared.discard(camera.id)
+            self._triggers_cleared.discard(camera.id)
             prefix = f"{self._config.mqtt.topic_prefix}/{camera.slug}/"
             for topic in [key for key in self._published if key.startswith(prefix)]:
                 del self._published[topic]
@@ -170,6 +207,7 @@ class StatePublisher:
         camera = state.camera
         await self.announce(camera)
         await self._clear_disabled_health(camera)
+        await self._clear_disabled_triggers(camera)
         for key in DETECTION_KEYS:
             await self._send(
                 detection_topic(self._config.mqtt, camera, key),
@@ -198,6 +236,29 @@ class StatePublisher:
         await self._send(
             health_topic(self._config.mqtt, camera),
             json.dumps(verdict.payload(), sort_keys=True),
+            force=True,
+        )
+
+    async def publish_trigger(self, camera: Camera, result: TriggerResult) -> None:
+        """Publish one trigger's answer about one camera.
+
+        An ``unknown`` answer -- no snapshot, no endpoint, a reply nobody could
+        read -- leaves the boolean exactly as it was. Reporting all-clear
+        because the model could not be reached would be a lie, and a trigger
+        whose whole job is to notice a fire must not quietly say "no fire"
+        when what it means is "I could not look".
+        """
+        if result.known:
+            await self._send(
+                trigger_topic(self._config.mqtt, camera, result.trigger),
+                payload_for(result.matched),
+            )
+        # Forced rather than change-suppressed: a periodic "still clear" is how
+        # a consumer tells a trigger that is running from one that has stopped,
+        # and `checked_at` would defeat the suppression anyway.
+        await self._send(
+            trigger_attributes_topic(self._config.mqtt, camera, result.trigger),
+            json.dumps(result.payload(), sort_keys=True),
             force=True,
         )
 

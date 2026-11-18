@@ -24,6 +24,7 @@ from .report import SheetWriter
 from .state import DetectionTracker
 from .store import EventStore
 from .topics import PAYLOAD_UNAVAILABLE
+from .triggers import TriggerWatcher, VisionTriggerJudge
 
 logger = logging.getLogger(__name__)
 
@@ -280,6 +281,32 @@ async def _serve(
                 config.health.model,
                 config.health.base_url,
             )
+        trigger_judges: list[VisionTriggerJudge] = []
+        for trigger in config.active_triggers:
+            trigger_judge = VisionTriggerJudge(trigger)
+            trigger_judges.append(trigger_judge)
+            watcher = TriggerWatcher(
+                trigger,
+                protect,
+                publisher,
+                trigger_judge,
+                is_current=lambda camera_id: camera_id in service.cameras,
+                metrics=metrics,
+            )
+            tasks.append(
+                asyncio.create_task(
+                    watcher.run_forever(lambda: list(service.cameras.values())),
+                    name=watcher.job,
+                )
+            )
+            logger.info(
+                "watching %s for %r every %g minute(s) with %s at %s",
+                "every camera" if trigger.all_cameras else ", ".join(trigger.cameras),
+                trigger.name,
+                trigger.interval_minutes,
+                trigger.model,
+                trigger.base_url,
+            )
         if config.protect.use_websocket:
             tasks.append(asyncio.create_task(service.watch_events_forever(), name="events"))
         if store is not None and config.reports is not None:
@@ -304,6 +331,9 @@ async def _serve(
             if judge is not None:
                 with contextlib.suppress(Exception):
                     await judge.aclose()
+            for trigger_judge in trigger_judges:
+                with contextlib.suppress(Exception):
+                    await trigger_judge.aclose()
             if exporter is not None:
                 with contextlib.suppress(Exception):
                     await exporter.aclose()

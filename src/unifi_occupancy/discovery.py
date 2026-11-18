@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import __version__
-from .config import Config
+from .config import Config, TriggerConfig
 from .models import DETECTION_KINDS, Camera, kind_for
 from .topics import (
     PAYLOAD_AVAILABLE,
@@ -29,6 +29,8 @@ from .topics import (
     health_topic,
     info_topic,
     service_info_topic,
+    trigger_attributes_topic,
+    trigger_topic,
 )
 
 MANUFACTURER = "Ubiquiti"
@@ -193,6 +195,43 @@ def health_messages(config: Config, camera: Camera) -> list[DiscoveryMessage]:
     ]
 
 
+def triggers_for(config: Config, camera: Camera) -> tuple[TriggerConfig, ...]:
+    """The configured triggers that watch this camera, switched on or not.
+
+    Disabled triggers are included so their entities can be retracted: a
+    trigger switched off in ``config.yaml`` should take its binary sensor with
+    it rather than leave Home Assistant holding one nothing will update again.
+    """
+    return tuple(trigger for trigger in config.triggers if trigger.selects(camera.id, camera.name))
+
+
+def trigger_messages(
+    config: Config, camera: Camera, trigger: TriggerConfig
+) -> list[DiscoveryMessage]:
+    """The one binary sensor for a custom trigger on a camera.
+
+    ``ON`` means the model could see what the trigger describes last time it
+    looked. The explanation, the model that answered and the time it answered
+    ride along as attributes, which is also where an ``unknown`` answer -- no
+    snapshot, no endpoint -- shows up, since those leave the boolean alone
+    rather than quietly reporting all-clear.
+    """
+    suffix = f"trigger_{trigger.key}"
+    payload: dict[str, Any] = {
+        **_device(config, camera),
+        "payload_on": PAYLOAD_ON,
+        "payload_off": PAYLOAD_OFF,
+        "name": trigger.name,
+        "unique_id": _unique_id(config, camera, suffix),
+        "object_id": _object_id(config, camera, suffix),
+        "state_topic": trigger_topic(config.mqtt, camera, trigger.key),
+        "json_attributes_topic": trigger_attributes_topic(config.mqtt, camera, trigger.key),
+    }
+    if trigger.device_class:
+        payload["device_class"] = trigger.device_class
+    return [DiscoveryMessage(_config_topic(config, camera, suffix), payload)]
+
+
 def discovery_messages(config: Config, camera: Camera) -> list[DiscoveryMessage]:
     """Every discovery config message for one camera."""
     messages: list[DiscoveryMessage] = []
@@ -243,6 +282,9 @@ def discovery_messages(config: Config, camera: Camera) -> list[DiscoveryMessage]
     )
     if config.health.enabled:
         messages.extend(health_messages(config, camera))
+    for trigger in triggers_for(config, camera):
+        if trigger.enabled:
+            messages.extend(trigger_messages(config, camera, trigger))
     return messages
 
 
@@ -257,6 +299,9 @@ def removal_messages(config: Config, camera: Camera) -> list[DiscoveryMessage]:
     messages = list(discovery_messages(config, camera))
     if not config.health.enabled:
         messages.extend(health_messages(config, camera))
+    for trigger in triggers_for(config, camera):
+        if not trigger.enabled:
+            messages.extend(trigger_messages(config, camera, trigger))
     return [DiscoveryMessage(message.topic, None) for message in messages]
 
 

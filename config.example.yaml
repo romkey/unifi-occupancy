@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# unifi-occupancy: camera groups and daily occupancy sheets
+# unifi-occupancy: camera groups, daily occupancy sheets, custom triggers
 #
 # Copy to ./config/config.yaml (mounted at /config/config.yaml in the
 # container) and edit. Protect and MQTT are configured in .env, not here.
@@ -66,3 +66,64 @@ groups:
     cameras:
       - Back Yard
       - Garage
+
+# ---------------------------------------------------------------------------
+# Custom triggers: things to watch the cameras for that Protect cannot report.
+#
+# Each trigger is a name and a question. Every interval_minutes the service
+# takes ONE snapshot of each camera the trigger names, asks a vision model the
+# question, and publishes the answer on
+#
+#   unifi-occupancy/<camera>/trigger/<name>             ON | OFF
+#   unifi-occupancy/<camera>/trigger/<name>/attributes  the explanation, etc.
+#
+# ON means the model could see what you described; OFF means it looked and
+# could not. An unanswerable check (no snapshot, endpoint down, unreadable
+# reply) publishes "unknown" to the attributes and leaves the boolean alone --
+# it never reports all-clear for a check it could not make.
+#
+# This is one of the two features that reads a picture: with a trigger written
+# here, snapshots leave the process for the endpoint below. They are held in
+# memory for one request and are never published, logged or written to disk.
+# Delete this whole block and no snapshot is ever taken.
+#
+# The endpoint, key and model default to the camera health check's
+# (CAMERA_HEALTH_* in .env), or to VISION_* if you set those; the keys below
+# override them for one trigger. The health check does not have to be on.
+# ---------------------------------------------------------------------------
+# triggers:
+#   - name: Fire
+#     # Say what counts and what does not: a vague prompt is a false alarm at
+#     # 3am. Ask about what is visible in the frame, nothing else.
+#     prompt: >
+#       Is there an active fire in this frame -- open flames, burning material,
+#       or thick smoke rising from something burning? Do not answer yes for
+#       lights, reflections, sunsets, headlights, a lit cigarette or a barbecue
+#       that is not out of control.
+#     # A list of camera names, slugs or Protect ids -- or ALL for every camera.
+#     cameras: ALL
+#     # How often each of those cameras is checked. Default 15.
+#     interval_minutes: 5
+#     # Home Assistant device class for the binary sensor: problem, smoke,
+#     # safety, door, ... Leave it out for a classless sensor.
+#     device_class: problem
+#
+#   - name: Gate left open
+#     prompt: Is the driveway gate standing open?
+#     cameras:
+#       - Driveway
+#     interval_minutes: 30
+#     # A model just for this trigger, on a server just for this trigger.
+#     model: qwen2.5vl:7b
+#     api_base_url: http://ollama.local:11434/v1
+#     device_class: door
+#
+#   - name: Parcel on the step
+#     prompt: Is there a parcel, box or padded envelope on the doorstep?
+#     cameras:
+#       - Front Door
+#     interval_minutes: 15
+#     # Keeps the trigger written down without running it. This is also how to
+#     # switch one off properly: it retracts the entity and empties the topics,
+#     # which deleting the block cannot do.
+#     enabled: false

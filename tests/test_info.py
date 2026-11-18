@@ -60,6 +60,7 @@ def test_service_info_reports_versions_and_features(config: Config) -> None:
         "ha_discovery": True,
         "occupancy_sheets": False,
         "camera_health": False,
+        "custom_triggers": False,
         "metrics": False,
     }
     assert payload["cameras"] == 3

@@ -21,6 +21,11 @@ It can also keep those booleans. Give it a `config.yaml` and it writes a **daily
 sheet** — one HTML page per day, a timeline per camera and per group, so you can see at a
 glance how busy an area was and when. Still just booleans; still no pictures.
 
+It can also watch for things Protect has no idea about. Give it a name and a question — *is
+there a fire in this doorway?* — and it asks a vision model that question about the cameras
+you name, on the interval you choose, and publishes the answer as one more boolean. Still no
+pictures on the broker.
+
 And it can tell you how it is doing: an optional, token-protected **Prometheus endpoint**
 reports every poll, every API failure, every detection's duration and every background job
 it runs.
@@ -56,6 +61,8 @@ unifi-occupancy/<camera>/smoke_enabled        ON | OFF
 unifi-occupancy/<camera>/attributes           {"camera_name": "Front Door", ...}
 unifi-occupancy/<camera>/info                 {"mac": "...", "firmware": "...", ...}
 unifi-occupancy/<camera>/health               {"health": "good"}   (opt-in)
+unifi-occupancy/<camera>/trigger/<name>       ON | OFF             (opt-in)
+unifi-occupancy/<camera>/trigger/<name>/attributes   {"state": "match", ...}
 ```
 
 `<camera>` is the camera's Protect name, lowercased with non-alphanumerics collapsed to
@@ -200,6 +207,98 @@ unless you switch it on, why it needs an API key with snapshot permission to wor
 and why the frames are held in memory for one request and never published, logged or
 written to disk. What reaches your broker is still a word and, at worst, a short sentence.
 If that trade is not one you want, do not set the variable and nothing changes.
+
+## Watching for something of your own
+
+Opt-in, configured in `config.yaml`, and the other feature that reads a picture.
+
+Protect reports what Protect knows how to report: motion, a person, a siren, a smoke alarm.
+It has nothing to say about the things that actually happen in a doorway — somebody setting
+a fire on the step, a gate left open, a parcel nobody collected, a van across the drive.
+Those are plain in a frame and absent from the API.
+
+So a **trigger** is a name and a question. Every interval it takes one snapshot of each
+camera it watches, puts your question to a vision model, and publishes the answer:
+
+```yaml
+triggers:
+  - name: Fire
+    prompt: >
+      Is there an active fire in this frame -- open flames, burning material, or
+      thick smoke rising from something burning? Do not answer yes for lights,
+      reflections, sunsets, headlights or a lit cigarette.
+    cameras: ALL
+    interval_minutes: 5
+    device_class: problem
+```
+
+```
+unifi-occupancy/front_door/trigger/fire             ON
+unifi-occupancy/front_door/trigger/fire/attributes  {"state": "match", "name": "Fire",
+                                                     "match": true,
+                                                     "explanation": "flames on the doormat",
+                                                     "model": "qwen2.5-vl", "checked_at": "..."}
+```
+
+`ON` means the model could see what you described the last time it looked, `OFF` means it
+looked and could not. A third answer, `unknown`, goes only to the attributes and **leaves
+the boolean exactly as it was**: no snapshot, no endpoint or a reply nobody could read is
+not the same as "no fire", and a trigger whose job is to notice a fire must never quietly
+report all-clear because it could not look.
+
+Each trigger takes:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `name` | *required* | What the trigger is called. Slugified for the topic and the entity id |
+| `prompt` | *required* | The question itself, in your own words |
+| `cameras` | `ALL` | A list of camera names, slugs or Protect ids — or `ALL` |
+| `interval_minutes` | `15` | How often each of those cameras is checked |
+| `enabled` | `true` | `false` keeps the trigger written down but stops it running |
+| `model` | the health check's | Model to ask; must be able to see images |
+| `api_base_url` | the health check's | OpenAI-compatible endpoint for this trigger |
+| `api_key` | the health check's | Optional; local servers need none |
+| `device_class` | unset | Home Assistant device class: `problem`, `smoke`, `safety`, … |
+| `high_quality_snapshot` | `false` | Full-resolution snapshots for this trigger |
+| `request_timeout` | `60` | Vision request timeout, seconds |
+| `stagger_seconds` | `5` | Gap between one camera's check and the next |
+| `max_explanation_chars` | `200` | Trim length for the explanation |
+| `append_answer_format` | `true` | Append the JSON answer format to your prompt |
+
+The endpoint, key and model default to whatever the camera health check uses, so a local
+vision server configured once serves both; `VISION_API_BASE_URL`, `VISION_API_KEY` and
+`VISION_MODEL` override them for triggers alone, and the keys above override them for one
+trigger. The health check itself does not have to be switched on for triggers to work.
+
+Answers are read as JSON when they are JSON and as prose when they are not, and the reading
+is biased towards `OFF`: an ambiguous reply is never a match, because a trigger that fires
+on ambiguity is worse than no trigger at all. Unless you set `append_answer_format: false`,
+your prompt has a short instruction appended asking for
+`{"match": true, "explanation": "…"}`, so you can write the question and nothing else.
+
+A trigger renamed or deleted outright leaves its last retained topics on the broker, since
+nothing is left to say they existed. Setting `enabled: false` instead retracts them
+properly — the entity, the boolean and its attributes — and is the way to switch one off.
+
+### Home Assistant
+
+Each trigger becomes one binary sensor per camera it watches, named after the trigger and
+sitting on that camera's device, with the explanation, the model and the check time as
+attributes. Give it a `device_class` and it looks like what it is: `problem` for a fire,
+`safety`, `smoke`, `door`, whatever fits. Automate on it exactly as you would on motion.
+
+### What it costs
+
+One image per watched camera per interval. A fire check on four doorways every five minutes
+is about 1,150 images a day — pennies on a small hosted model, free on your own hardware,
+and the reason the default interval is fifteen minutes rather than one. Pick the interval
+for how fast the thing you are watching for matters, keep the camera list short, and prefer
+a local model if you intend to run it at minutes.
+
+The same trade as the health check applies: with a trigger configured, snapshots leave this
+process for the endpoint you named. They are held in memory for one request and are never
+published, logged or written to disk; what reaches your broker is a boolean and, at worst, a
+short sentence. Write no triggers and no snapshot is ever taken.
 
 ## Daily occupancy sheets
 
@@ -409,8 +508,9 @@ prefixed `unifi_occupancy_`; the table leaves that off to stay readable.
 | `camera_detection_enabled{camera,kind}`, `camera_detection_supported{camera,kind}` | What each camera can do, and what is switched on — a detection quietly turned off in Protect is visible here |
 | `detections_total{camera,kind}`, `detection_seconds_total{camera,kind}` | How often each detection has fired, and how long it has spent on |
 | `mqtt_publishes_total{outcome}`, `mqtt_published_bytes_total`, `mqtt_publishes_suppressed_total`, `mqtt_last_publish_timestamp_seconds` | What went to the broker, what was skipped as unchanged, and when |
-| `job_runs_total{job,outcome}`, `job_duration_seconds{job}`, `job_in_progress{job}`, `job_last_success_timestamp_seconds{job}` | The four background jobs — `poll`, `events`, `health_sweep`, `sheets` — their outcomes, durations and last success |
+| `job_runs_total{job,outcome}`, `job_duration_seconds{job}`, `job_in_progress{job}`, `job_last_success_timestamp_seconds{job}` | The background jobs — `poll`, `events`, `health_sweep`, `sheets` and one `trigger:<name>` per custom trigger — their outcomes, durations and last success |
 | `health_checks_total{camera,verdict}`, `health_check_duration_seconds`, `camera_health{camera,status}`, `health_last_check_timestamp_seconds{camera}` | The optional vision check: verdicts per camera, how long each took, when each was last looked at |
+| `trigger_checks_total{trigger,camera,answer}`, `trigger_check_duration_seconds{trigger}`, `trigger_state{trigger,camera,state}`, `trigger_last_check_timestamp_seconds{trigger,camera}` | Custom triggers: answers per trigger and camera, how long each check took, when each was last asked |
 | `recorded_edges_total{kind,edge}`, `recorder_failures_total{operation}`, `sheets_written_total` | The history database and the daily sheets |
 | `http_requests_total{path,status}`, `http_request_duration_seconds` | This endpoint itself |
 | `process_cpu_seconds_total`, `process_max_resident_bytes`, `asyncio_tasks` | What the process is costing |
@@ -538,12 +638,19 @@ groups and the daily sheets are YAML; see [above](#configuration).
 | `CAMERA_HEALTH_REQUEST_TIMEOUT` | `60` | Vision request timeout, seconds |
 | `CAMERA_HEALTH_HIGH_QUALITY_SNAPSHOT` | `false` | Full-resolution snapshots |
 | `CAMERA_HEALTH_MAX_EXPLANATION_CHARS` | `200` | Trim length for a `bad` explanation |
+| `VISION_API_BASE_URL` | `CAMERA_HEALTH_API_BASE_URL` | Default endpoint for custom triggers |
+| `VISION_API_KEY` | `CAMERA_HEALTH_API_KEY` | Default key for custom triggers |
+| `VISION_MODEL` | `CAMERA_HEALTH_MODEL` | Default model for custom triggers |
+| `VISION_REQUEST_TIMEOUT` | `CAMERA_HEALTH_REQUEST_TIMEOUT` | Default trigger request timeout |
+| `VISION_STAGGER_SECONDS` | `CAMERA_HEALTH_STAGGER_SECONDS` | Default gap within a trigger sweep |
+| `VISION_HIGH_QUALITY_SNAPSHOT` | `CAMERA_HEALTH_HIGH_QUALITY_SNAPSHOT` | Default snapshot quality |
+| `VISION_MAX_EXPLANATION_CHARS` | `CAMERA_HEALTH_MAX_EXPLANATION_CHARS` | Default explanation trim |
 | `METRICS_ENABLED` | `false` | Serve the Prometheus endpoint |
 | `METRICS_TOKEN` | unset | *Required* when the endpoint is on; at least 16 characters |
 | `METRICS_HOST` | `0.0.0.0` | Address to bind |
 | `METRICS_PORT` | `9833` | Port to bind |
 | `METRICS_PATH` | `/metrics` | Path the endpoint answers on |
-| `CONFIG_FILE` | `/config/config.yaml` | Groups, periods and sheets. No file, no sheets |
+| `CONFIG_FILE` | `/config/config.yaml` | Groups, periods, sheets and triggers. No file, none of them |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 
 ## Development
@@ -582,7 +689,9 @@ mosquitto_sub -h localhost -t 'unifi-occupancy/#' -v
 | `protect.py` | Read-only Protect HTTP + websocket client |
 | `discovery.py` | Home Assistant discovery payloads |
 | `info.py` | The `info` metadata payloads for the service and each camera |
+| `vision.py` | One frame, one prompt, one short answer, over chat completions |
 | `health.py` | The optional vision check: snapshot, ask, verdict, schedule |
+| `triggers.py` | Custom triggers: your question, your cameras, your interval |
 | `publisher.py` | Topic layout, change detection, retraction |
 | `metrics.py` | The counters, gauges and histograms, and the exposition format |
 | `exporter.py` | The token-protected `/metrics` HTTP endpoint |
@@ -599,10 +708,11 @@ controller and no broker.
 
 - Only `/meta/info`, `/nvrs` and `/cameras` are read, plus the event subscription. Video and
   stream endpoints are never called.
-- The snapshot endpoint is called only with `CAMERA_HEALTH_ENABLED=true`, and only for the
-  health check: one frame per camera per interval, sent to the endpoint you configured,
-  held in memory for the length of that one request, and never published to MQTT, written
-  to disk or logged. Leave the variable unset and no snapshot is ever taken.
+- The snapshot endpoint is called only by the two vision features — the health check with
+  `CAMERA_HEALTH_ENABLED=true`, and any trigger you write in `config.yaml`. One frame per
+  camera per interval, sent to the endpoint you configured, held in memory for the length of
+  that one request, and never published to MQTT, written to disk or logged. Leave the
+  variable unset and write no triggers, and no snapshot is ever taken.
 - Published attributes are limited to camera id, name, model, hardware, connection state,
   last motion time and which detections the hardware supports.
 - The `info` topics add the console's name, type, version and uptime, and each camera's MAC,

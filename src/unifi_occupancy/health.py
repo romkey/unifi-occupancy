@@ -16,8 +16,6 @@ to disk. What reaches MQTT is a word and, at worst, a short sentence.
 from __future__ import annotations
 
 import asyncio
-import base64
-import json
 import logging
 import re
 import time
@@ -32,6 +30,14 @@ import httpx
 from .config import HealthConfig
 from .metrics import OUTCOME_ERROR, OUTCOME_SUCCESS, Metrics, default_metrics
 from .models import Camera
+from .vision import (
+    VisionClient,
+    VisionEndpoint,
+    VisionError,
+    json_object,
+    mentions,
+    tidy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +46,7 @@ BAD = "bad"
 UNKNOWN = "unknown"
 
 
-class HealthError(RuntimeError):
+class HealthError(VisionError):
     """The vision endpoint could not be reached or did not make sense."""
 
 
@@ -69,55 +75,10 @@ class HealthVerdict:
         return payload
 
 
-def _tidy(text: str | None, limit: int) -> str | None:
-    if not text:
-        return None
-    collapsed = " ".join(str(text).split())
-    if not collapsed:
-        return None
-    if len(collapsed) <= limit:
-        return collapsed
-    return collapsed[: limit - 1].rstrip() + "…"
-
-
-def _json_object(text: str) -> dict[str, Any] | None:
-    """The first JSON object in a reply, fenced or prefaced or neither."""
-    start = text.find("{")
-    end = text.rfind("}")
-    if start < 0 or end <= start:
-        return None
-    try:
-        parsed = json.loads(text[start : end + 1])
-    except ValueError:
-        return None
-    return parsed if isinstance(parsed, dict) else None
-
-
 #: Words that, un-negated, mean the model is reporting a fault, and words that
 #: mean it is not. Matched on whole words: "badly" is a problem, "badger" is not.
 _PROBLEM_WORDS = re.compile(r"\b(?:bad|badly|obscur\w*|obstruct\w*|blocked|broken|unusable)\b")
 _HEALTHY_WORDS = re.compile(r"\b(?:good|healthy|fine|usable|normal|ok|okay)\b")
-#: A negation anywhere in the clause before a word flips its sense: "not
-#: blocked" and "no obstruction" must never read as a fault.
-_NEGATION = re.compile(
-    r"\b(?:not|no|never|nothing|none|isn't|aren't|wasn't|doesn't|don't|without|free|clear)\b"
-)
-
-
-def _mentions(words: re.Pattern[str], text: str) -> bool:
-    """True when ``text`` uses one of ``words`` and does not negate it.
-
-    A model that answers in prose rather than JSON is being read generously, so
-    the reading has to be careful: "the view is not blocked" contains the word
-    "blocked" and means the opposite of it. Anything ambiguous falls through to
-    ``unknown``, which raises no alarm.
-    """
-    for match in words.finditer(text):
-        clause = text[: match.start()].rsplit(".", 1)[-1]
-        if _NEGATION.search(clause[-60:]):
-            continue
-        return True
-    return False
 
 
 def parse_verdict(text: str, *, limit: int = 200) -> tuple[str, str | None]:
@@ -128,25 +89,25 @@ def parse_verdict(text: str, *, limit: int = 200) -> tuple[str, str | None]:
     like to wrap JSON in prose or skip it entirely. So: JSON if there is any,
     then the plainest possible reading of the words, then ``unknown``.
     """
-    body = _json_object(text)
+    body = json_object(text)
     if body is not None:
         raw = body.get("health", body.get("status"))
         status = str(raw).strip().lower() if raw is not None else ""
-        explanation = _tidy(body.get("explanation") or body.get("reason") or body.get("why"), limit)
+        explanation = tidy(body.get("explanation") or body.get("reason") or body.get("why"), limit)
         if status in {GOOD, "ok", "healthy", "fine"}:
             return GOOD, explanation
         if status in {BAD, "problem", "unhealthy", "obscured", "blocked"}:
             return BAD, explanation or "the model reported a problem without saying what"
-        return UNKNOWN, _tidy(f"unrecognised verdict {status!r}", limit)
+        return UNKNOWN, tidy(f"unrecognised verdict {status!r}", limit)
 
     lowered = text.strip().lower()
     if lowered.startswith(GOOD) or lowered in {"ok", "healthy"}:
         return GOOD, None
-    if _mentions(_PROBLEM_WORDS, lowered):
-        return BAD, _tidy(text, limit)
-    if _mentions(_HEALTHY_WORDS, lowered):
+    if mentions(_PROBLEM_WORDS, lowered):
+        return BAD, tidy(text, limit)
+    if mentions(_HEALTHY_WORDS, lowered):
         return GOOD, None
-    return UNKNOWN, _tidy(f"could not read the model's reply: {text}", limit)
+    return UNKNOWN, tidy(f"could not read the model's reply: {text}", limit)
 
 
 class Judge(Protocol):
@@ -160,13 +121,14 @@ class VisionJudge:
 
     Works against OpenAI itself, and equally against anything that speaks the
     same shape -- Ollama, llama.cpp, vLLM, LM Studio, OpenRouter -- which is why
-    the API key is optional.
+    the API key is optional. The exchange itself lives in
+    :class:`~unifi_occupancy.vision.VisionClient`; what is here is the health
+    question and the reading of its answer.
     """
 
     def __init__(self, config: HealthConfig, client: httpx.AsyncClient | None = None) -> None:
         self._config = config
-        self._owns_client = client is None
-        self._client = client or httpx.AsyncClient(timeout=config.request_timeout)
+        self._client = VisionClient(endpoint_for(config), client)
 
     async def __aenter__(self) -> VisionJudge:
         return self
@@ -180,96 +142,38 @@ class VisionJudge:
         await self.aclose()
 
     async def aclose(self) -> None:
-        if self._owns_client:
-            await self._client.aclose()
+        await self._client.aclose()
 
     @property
     def headers(self) -> dict[str, str]:
-        headers = {"Content-Type": "application/json"}
-        if self._config.api_key:
-            headers["Authorization"] = f"Bearer {self._config.api_key}"
-        return headers
+        return self._client.headers
 
     def request_body(self, image: bytes, content_type: str) -> dict[str, Any]:
-        encoded = base64.b64encode(image).decode("ascii")
-        return {
-            "model": self._config.model,
-            # Deterministic: the same picture should not be healthy on one hour
-            # and broken on the next.
-            "temperature": 0,
-            "max_tokens": 200,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": self._config.prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:{content_type};base64,{encoded}"},
-                        },
-                    ],
-                }
-            ],
-        }
+        return self._client.request_body(self._config.prompt, image, content_type)
 
     async def judge(self, image: bytes, *, content_type: str = "image/jpeg") -> HealthVerdict:
         try:
-            response = await self._client.post(
-                self._config.completions_url,
-                json=self.request_body(image, content_type),
-                headers=self.headers,
-            )
-        except httpx.HTTPError as exc:
-            raise HealthError(f"vision request failed: {exc}") from exc
+            reply = await self._client.ask(self._config.prompt, image, content_type=content_type)
+        except VisionError as exc:
+            raise HealthError(str(exc)) from exc
 
-        if response.status_code >= 400:
-            # The body often says exactly what is wrong (bad key, unknown
-            # model); it is worth having in the log, trimmed.
-            raise HealthError(
-                f"vision endpoint returned {response.status_code}: "
-                f"{_tidy(response.text, 200) or '(no body)'}"
-            )
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise HealthError("vision endpoint returned non-JSON") from exc
-
-        text = _reply_text(payload)
-        if text is None:
-            raise HealthError("vision endpoint returned no message content")
-
-        status, explanation = parse_verdict(text, limit=self._config.max_explanation_chars)
+        status, explanation = parse_verdict(reply.text, limit=self._config.max_explanation_chars)
         return HealthVerdict(
             status=status,
             explanation=explanation,
-            model=str(payload.get("model") or self._config.model),
+            model=reply.model or self._config.model,
             checked_at=datetime.now(UTC),
         )
 
 
-def _reply_text(payload: Any) -> str | None:
-    """The assistant's text, across the shapes servers actually return."""
-    if not isinstance(payload, dict):
-        return None
-    choices = payload.get("choices")
-    if not isinstance(choices, list) or not choices:
-        return None
-    first = choices[0]
-    if not isinstance(first, dict):
-        return None
-    message = first.get("message")
-    content: Any = message.get("content") if isinstance(message, dict) else first.get("text")
-    if isinstance(content, list):
-        # Some servers return the content as a list of parts.
-        parts = [
-            part.get("text")
-            for part in content
-            if isinstance(part, dict) and isinstance(part.get("text"), str)
-        ]
-        content = " ".join(part for part in parts if part)
-    if isinstance(content, str) and content.strip():
-        return content
-    return None
+def endpoint_for(config: HealthConfig) -> VisionEndpoint:
+    """The vision endpoint described by the health settings."""
+    return VisionEndpoint(
+        base_url=config.base_url,
+        api_key=config.api_key,
+        model=config.model,
+        request_timeout=config.request_timeout,
+    )
 
 
 class Snapshots(Protocol):
@@ -342,7 +246,7 @@ class CameraHealthMonitor:
             logger.warning("no snapshot for %s: %s", camera.name, exc)
             return HealthVerdict(
                 status=UNKNOWN,
-                explanation=_tidy(f"could not take a snapshot: {exc}", 200),
+                explanation=tidy(f"could not take a snapshot: {exc}", 200),
                 checked_at=datetime.now(UTC),
             )
         if not image:
@@ -358,7 +262,7 @@ class CameraHealthMonitor:
             logger.warning("health check for %s failed: %s", camera.name, exc)
             return HealthVerdict(
                 status=UNKNOWN,
-                explanation=_tidy(str(exc), self._config.max_explanation_chars),
+                explanation=tidy(str(exc), self._config.max_explanation_chars),
                 checked_at=datetime.now(UTC),
             )
 
