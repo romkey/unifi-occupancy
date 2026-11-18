@@ -81,7 +81,7 @@ features are switched on, and how many cameras it can see.
 ```json
 {
   "service": "unifi-occupancy",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "protect": {
     "host": "192.168.1.1",
     "port": 443,
@@ -95,9 +95,17 @@ features are switched on, and how many cameras it can see.
     "ha_discovery": true,
     "occupancy_sheets": true,
     "camera_health": false,
+    "custom_triggers": true,
+    "trigger_snapshots": false,
     "metrics": false
   },
   "detections": ["motion", "person", "siren", "smoke"],
+  "triggers": [
+    {
+      "name": "Fire", "key": "fire", "cameras": "all",
+      "interval_minutes": 5, "model": "qwen2.5-vl", "publish_snapshot": false
+    }
+  ],
   "cameras": 7
 }
 ```
