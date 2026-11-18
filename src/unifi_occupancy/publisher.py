@@ -94,7 +94,7 @@ class StatePublisher:
         self._metrics.record_publish(payload, outcome=OUTCOME_SUCCESS)
         self._published[topic] = payload
 
-    async def _send_snapshot(self, topic: str, image: bytes) -> None:
+    async def _send_snapshot(self, topic: str, image: bytes) -> bool:
         """Put one frame on the broker, unretained and unremembered.
 
         Deliberately not :meth:`_send`: that keeps every payload it sends in
@@ -104,13 +104,30 @@ class StatePublisher:
         nothing is compared, and ``retain=False`` is passed explicitly rather
         than taken from the config -- a retained frame would outlive the match
         it belongs to, and no MQTT setting should be able to turn that on.
+
+        Best-effort, and the only publish in this class that is. Everything
+        else here lets a transport failure propagate so the service notices it
+        has lost the broker, but a frame is the one payload whose delivery is
+        worth less than what follows it: it goes out before the boolean so an
+        automation finds the picture already there, which means a frame the
+        broker refuses -- most likely for its size -- would otherwise suppress
+        the alarm it was meant to illustrate and abandon the rest of the sweep.
+        A fire with no picture is still a fire. Returns whether it went.
         """
         try:
             await self._transport.publish(topic, image, retain=False, qos=self._config.mqtt.qos)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - never worth losing the alarm over
             self._metrics.record_publish(None, outcome=OUTCOME_ERROR)
-            raise
+            logger.warning(
+                "could not publish the %d-byte frame that matched to %s: %s. "
+                "The trigger's state is being published regardless",
+                len(image),
+                topic,
+                exc,
+            )
+            return False
         self._metrics.record_publish(image, outcome=OUTCOME_SUCCESS)
+        return True
 
     async def publish_availability(self, online: bool) -> None:
         await self._send(
@@ -284,14 +301,17 @@ class StatePublisher:
 
         ``snapshot`` is the frame that matched, and arrives only from a trigger
         configured to publish one. It goes out before the boolean so that an
-        automation firing on the boolean finds the image already there.
+        automation firing on the boolean finds the image already there -- but it
+        cannot hold the boolean up: a frame the broker will not take is logged
+        and dropped, and the state is published either way.
         """
         if snapshot and result.matched:
-            await self._send_snapshot(
+            sent = await self._send_snapshot(
                 trigger_snapshot_topic(self._config.mqtt, camera, result.trigger),
                 snapshot,
             )
-            self._metrics.record_trigger_snapshot(result.trigger, camera)
+            if sent:
+                self._metrics.record_trigger_snapshot(result.trigger, camera)
         if result.known:
             await self._send(
                 trigger_topic(self._config.mqtt, camera, result.trigger),

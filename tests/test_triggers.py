@@ -925,3 +925,95 @@ def test_a_switched_off_snapshot_trigger_does_not_count(config: Config) -> None:
     payload = service_info_payload(config)
 
     assert payload["features"]["trigger_snapshots"] is False
+
+
+class RefusingTransport(FakeTransport):
+    """A broker that will not take the frame -- a size limit, typically."""
+
+    def __init__(self, refuse: str) -> None:
+        super().__init__()
+        self._refuse = refuse
+
+    async def publish(
+        self, topic: str, payload: str | bytes | None, *, retain: bool, qos: int
+    ) -> None:
+        if topic == self._refuse:
+            raise RuntimeError("payload exceeds the broker's message_size_limit")
+        await super().publish(topic, payload, retain=retain, qos=qos)
+
+
+async def test_a_frame_the_broker_refuses_does_not_suppress_the_alarm(config: Config) -> None:
+    """The picture is worth less than the thing it illustrates."""
+    config = triggered_config(config, SNAPPY)
+    transport = RefusingTransport("unifi-occupancy/front_door/trigger/fire/snapshot")
+    publisher = StatePublisher(config, transport)
+    result = TriggerResult(trigger="fire", name="Fire", status=MATCH, explanation="flames")
+
+    await publisher.publish_trigger(CAMERA, result, IMAGE)
+
+    assert transport.payload_for("unifi-occupancy/front_door/trigger/fire") == "ON"
+    attributes = json.loads(
+        transport.payload_for("unifi-occupancy/front_door/trigger/fire/attributes") or "{}"
+    )
+    assert attributes["state"] == "match"
+
+
+async def test_a_refused_frame_is_not_counted_as_published(config: Config) -> None:
+    config = triggered_config(config, SNAPPY)
+    transport = RefusingTransport("unifi-occupancy/front_door/trigger/fire/snapshot")
+    metrics = Metrics()
+    publisher = StatePublisher(config, transport, metrics=metrics)
+
+    await publisher.publish_trigger(
+        CAMERA, TriggerResult(trigger="fire", name="Fire", status=MATCH), IMAGE
+    )
+
+    rendered = metrics.render()
+    assert "unifi_occupancy_trigger_snapshots_total{" not in rendered
+    assert 'unifi_occupancy_mqtt_publishes_total{outcome="error"} 1' in rendered
+
+
+async def test_a_refused_frame_says_so_in_the_log(
+    config: Config, caplog: pytest.LogCaptureFixture
+) -> None:
+    config = triggered_config(config, SNAPPY)
+    transport = RefusingTransport("unifi-occupancy/front_door/trigger/fire/snapshot")
+    publisher = StatePublisher(config, transport)
+
+    with caplog.at_level("WARNING"):
+        await publisher.publish_trigger(
+            CAMERA, TriggerResult(trigger="fire", name="Fire", status=MATCH), IMAGE
+        )
+
+    assert "message_size_limit" in caplog.text
+    assert "being published regardless" in caplog.text
+
+
+async def test_a_sweep_carries_on_after_a_frame_is_refused(config: Config) -> None:
+    """One camera's refused frame must not abandon the cameras after it."""
+    config = triggered_config(config, SNAPPY)
+    transport = RefusingTransport("unifi-occupancy/front_door/trigger/fire/snapshot")
+    publisher = StatePublisher(config, transport)
+    watcher = watcher_for(
+        FakeSnapshots(IMAGE), FakeJudge(TriggerAnswer(MATCH, "flames")), publisher, SNAPPY
+    )
+
+    results = await watcher.sweep([CAMERA, OTHER])
+
+    assert [result.status for result in results] == [MATCH, MATCH]
+    assert transport.payload_for("unifi-occupancy/front_door/trigger/fire") == "ON"
+    assert transport.payload_for("unifi-occupancy/back_yard/trigger/fire") == "ON"
+    # The camera whose frame the broker *did* accept still got one.
+    assert transport.sent("unifi-occupancy/back_yard/trigger/fire/snapshot")
+
+
+async def test_losing_the_broker_outright_still_propagates(config: Config) -> None:
+    """Best-effort applies to the frame alone, not to the state beside it."""
+    config = triggered_config(config, SNAPPY)
+    transport = RefusingTransport("unifi-occupancy/front_door/trigger/fire")
+    publisher = StatePublisher(config, transport)
+
+    with pytest.raises(RuntimeError):
+        await publisher.publish_trigger(
+            CAMERA, TriggerResult(trigger="fire", name="Fire", status=MATCH), IMAGE
+        )

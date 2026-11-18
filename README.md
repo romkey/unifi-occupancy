@@ -307,6 +307,10 @@ pictures of their doorways by setting a single variable. Before you turn it on:
   outlive the match. Home Assistant holds the last one for as long as the entity exists.
 - Only a `match` publishes a frame. `clear` and `unknown` publish nothing, so an endpoint
   that is down does not fill the broker with pictures.
+- The frame is best-effort. It goes out just before the boolean so an automation finds the
+  picture already there, but a frame the broker refuses — a message size limit, most likely —
+  is logged and dropped, and the boolean and its attributes are published anyway. A fire with
+  no picture is still a fire.
 - Nothing is written to disk on any path, with this on or off.
 - A high-quality snapshot can run to a megabyte or two. Brokers have message size limits
   (mosquitto's default `message_size_limit` is unlimited, but check yours) and some log
