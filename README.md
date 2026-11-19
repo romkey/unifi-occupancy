@@ -379,7 +379,9 @@ Assistant shows it as unknown until then, which is correct rather than a fault.
 does the above from the UI: pick the triggers you care about, pick how you want to be told,
 and it works out the rest. Copy it into `<config>/blueprints/automation/unifi_occupancy/`
 and reload automations, or import it by URL from **Settings → Automations & Scenes →
-Blueprints → Import**.
+Blueprints → Import**. It declares no `min_version`, and uses the long-standing
+`trigger:`/`condition:`/`action:` syntax rather than the newer plural keys, so it imports on
+an older Home Assistant as well as a current one.
 
 It derives each trigger's status sensor and snapshot camera from the sensor that fired, so
 you select one set of entities rather than pairing three up by hand. It then exposes

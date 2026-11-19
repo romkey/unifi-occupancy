@@ -56,7 +56,6 @@ blueprint:
     ```
   domain: automation
   source_url: https://github.com/romkey/unifi-occupancy/blob/main/blueprints/automation/unifi_occupancy/trigger_notify.yaml
-  min_version: 2024.6.0
   input:
     watched:
       name: Triggers to watch
@@ -117,8 +116,13 @@ mode: queued
 max: 10
 max_exceeded: silent
 
-triggers:
-  - trigger: state
+# Deliberately the long-standing singular keys and `platform:` rather than the
+# newer `triggers:`/`conditions:`/`actions:` plural form and `trigger: state`.
+# Both work on a current Home Assistant, but only this one works on an older
+# installation -- and the plural form would oblige this blueprint to declare a
+# `min_version` of 2024.10.0, locking out people it would otherwise serve.
+trigger:
+  - platform: state
     entity_id: !input watched
     to: "on"
 
@@ -150,7 +154,7 @@ variables:
   message: >-
     {{ explanation if explanation else trigger_name ~ ' matched on ' ~ camera_name }}
 
-conditions:
+condition:
   # Require a real `match` rather than a boolean that happens to be ON. Skipped
   # when the status sensor is missing, so renaming it loses the check instead of
   # silently stopping every notification.
@@ -166,4 +170,4 @@ conditions:
          or (now() - this.attributes.last_triggered).total_seconds()
             > quiet_minutes | int(0) * 60 }}
 
-actions: !input notification
+action: !input notification
