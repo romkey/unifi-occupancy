@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from unifi_occupancy.config import ReportConfig, parse_report_config
-from unifi_occupancy.models import MOTION, PERSON, SMOKE, Camera
+from unifi_occupancy.config import ReportConfig, TriggerConfig, parse_report_config
+from unifi_occupancy.models import MOTION, PERSON, SMOKE, Camera, trigger_kind
+from unifi_occupancy.recorder import EventRecorder
 from unifi_occupancy.report import SheetWriter, day_window, next_refresh
 from unifi_occupancy.store import EventStore
+from unifi_occupancy.triggers import CLEAR, MATCH, TriggerResult
 
 NY = ZoneInfo("America/New_York")
 DAY = date(2026, 10, 20)
@@ -257,6 +260,187 @@ def test_other_detections_appear_only_when_they_fire(
     assert [track.kind for track in sections[1].rows[0].tracks] == [MOTION, PERSON]
 
 
+# -- custom triggers on the timelines ---------------------------------------
+
+
+FIRE = TriggerConfig(name="Fire or smoke", prompt="?", cameras=("Front Door",))
+GATE = TriggerConfig(name="Gate left open", prompt="?")
+FIRE_KIND = trigger_kind("fire_or_smoke")
+GATE_KIND = trigger_kind("gate_left_open")
+
+
+@pytest.fixture
+def triggered(store: EventStore, reports: ReportConfig) -> SheetWriter:
+    return SheetWriter(
+        store,
+        reports,
+        cameras=lambda: CAMERAS,
+        triggers=(FIRE, GATE),
+        clock=lambda: NOON.astimezone(UTC),
+    )
+
+
+def test_a_trigger_gets_a_lane_after_the_detections(triggered: SheetWriter) -> None:
+    _, sections, _, _ = triggered._build(DAY)
+
+    assert [track.kind for track in sections[0].rows[0].tracks] == [
+        MOTION,
+        PERSON,
+        FIRE_KIND,
+        GATE_KIND,
+    ]
+
+
+def test_a_trigger_lane_is_measured_like_any_other(
+    triggered: SheetWriter, store: EventStore
+) -> None:
+    record(store, CAMERAS[0], FIRE_KIND, at(14, 12), 1680)
+
+    _, sections, _, _ = triggered._build(DAY)
+    track = next(t for t in sections[0].rows[1].tracks if t.kind == FIRE_KIND)
+
+    assert track.events == 1
+    assert track.seconds == 1680.0
+    assert track.buckets[14] == 1
+    assert track.name == "Fire or smoke"
+
+
+def test_a_trigger_that_has_never_fired_still_gets_its_lane(triggered: SheetWriter) -> None:
+    """The same reason motion gets one: a lane saying nothing happened is the answer."""
+    _, sections, _, _ = triggered._build(DAY)
+    track = next(t for t in sections[0].rows[0].tracks if t.kind == GATE_KIND)
+
+    assert track.events == 0
+    assert track.watched is True
+
+
+def test_a_camera_the_trigger_does_not_watch_reads_as_not_watched(
+    triggered: SheetWriter,
+) -> None:
+    """ "No events" on a camera nobody asked about would be the sheet lying."""
+    _, sections, _, _ = triggered._build(DAY)
+    rows = {row.label: row for row in sections[0].rows}
+
+    assert next(t for t in rows["Front Door"].tracks if t.kind == FIRE_KIND).watched is True
+    assert next(t for t in rows["Driveway"].tracks if t.kind == FIRE_KIND).watched is False
+    # The group total is watched if any of its cameras is.
+    assert next(t for t in rows["All cameras"].tracks if t.kind == FIRE_KIND).watched is True
+
+
+def test_a_trigger_kept_out_of_the_history_earns_no_empty_lane(
+    store: EventStore, reports: ReportConfig
+) -> None:
+    """It can never fill one, so drawing it would promise what cannot arrive."""
+    writer = SheetWriter(
+        store,
+        reports,
+        cameras=lambda: CAMERAS,
+        triggers=(replace(GATE, record=False),),
+        clock=lambda: NOON.astimezone(UTC),
+    )
+
+    _, sections, _, _ = writer._build(DAY)
+
+    assert [track.kind for track in sections[0].rows[0].tracks] == [MOTION, PERSON]
+
+
+def test_a_trigger_kept_out_of_the_history_keeps_the_days_it_was_in(
+    store: EventStore, reports: ReportConfig
+) -> None:
+    """Switching it off stops new rows; it does not rewrite the old ones."""
+    record(store, CAMERAS[0], GATE_KIND, at(9), 600)
+    writer = SheetWriter(
+        store,
+        reports,
+        cameras=lambda: CAMERAS,
+        triggers=(replace(GATE, record=False),),
+        clock=lambda: NOON.astimezone(UTC),
+    )
+
+    _, sections, _, _ = writer._build(DAY)
+    track = next(t for t in sections[0].rows[0].tracks if t.kind == GATE_KIND)
+
+    assert (track.events, track.name) == (1, "Gate left open")
+
+
+def test_a_disabled_trigger_earns_no_lane_of_its_own(
+    store: EventStore, reports: ReportConfig
+) -> None:
+    writer = SheetWriter(
+        store,
+        reports,
+        cameras=lambda: CAMERAS,
+        triggers=(replace(GATE, enabled=False),),
+        clock=lambda: NOON.astimezone(UTC),
+    )
+
+    _, sections, _, _ = writer._build(DAY)
+
+    assert [track.kind for track in sections[0].rows[0].tracks] == [MOTION, PERSON]
+
+
+def test_a_deleted_trigger_keeps_the_day_it_fired_on(
+    writer: SheetWriter, store: EventStore
+) -> None:
+    """Deleting the question does not unhappen the answer; the slug names it."""
+    record(store, CAMERAS[0], trigger_kind("gone_away"), at(3), 300)
+
+    _, sections, _, _ = writer._build(DAY)
+    track = next(t for t in sections[0].rows[0].tracks if t.kind == trigger_kind("gone_away"))
+
+    assert track.events == 1
+    assert track.name == "Gone Away"
+
+
+def test_trigger_lanes_are_ordered_by_name(triggered: SheetWriter, store: EventStore) -> None:
+    """So the sheet does not reshuffle when one of them fires for the first time."""
+    record(store, CAMERAS[0], trigger_kind("a_first_question"), at(3), 60)
+
+    _, sections, _, _ = triggered._build(DAY)
+    names = [track.name for track in sections[0].rows[0].tracks]
+
+    assert names == ["Motion", "Person", "A First Question", "Fire or smoke", "Gate left open"]
+
+
+def test_a_trigger_is_summarised_for_the_index_too(
+    triggered: SheetWriter, store: EventStore
+) -> None:
+    record(store, CAMERAS[0], FIRE_KIND, at(14), 60)
+
+    _, _, _, summaries = triggered._build(DAY)
+    row = next(row for row in summaries if row.kind == FIRE_KIND)
+
+    assert row.group_name == "Front of house"
+    assert (row.events, row.seconds) == (1, 60.0)
+
+
+def test_a_trigger_match_travels_from_the_answer_to_the_page(
+    store: EventStore, reports: ReportConfig
+) -> None:
+    """The whole path, with nothing faked but the clock and the model."""
+    now = [at(14, 12).astimezone(UTC)]
+    recorder = EventRecorder(store, clock=lambda: now[0])
+    answered = TriggerResult(trigger="fire_or_smoke", name="Fire or smoke", status=MATCH)
+
+    recorder.record_trigger(CAMERAS[0], answered)
+    now[0] = at(14, 40).astimezone(UTC)
+    recorder.record_trigger(CAMERAS[0], replace(answered, status=CLEAR))
+
+    writer = SheetWriter(
+        store,
+        reports,
+        cameras=lambda: CAMERAS,
+        triggers=(FIRE,),
+        clock=lambda: NOON.astimezone(UTC),
+    )
+    writer.refresh()
+
+    page = (reports.output_dir / f"{DAY.isoformat()}.html").read_text(encoding="utf-8")
+    assert '<div class="track trigger">' in page
+    assert "<b>Fire or smoke</b>" in page
+    assert "28m 00s" in page
+
+
 # -- writing the files ------------------------------------------------------
 
 
@@ -437,7 +621,7 @@ def test_bands_sharing_a_name_share_a_shade(store: EventStore, reports: ReportCo
         **{
             **reports.__dict__,
             "periods": parse_report_config(
-                'periods:\n  - {name: Day, start: "06:00"}\n' '  - {name: Night, start: "22:00"}\n'
+                'periods:\n  - {name: Day, start: "06:00"}\n  - {name: Night, start: "22:00"}\n'
             ).periods,
         }
     )

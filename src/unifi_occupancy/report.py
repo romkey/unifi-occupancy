@@ -20,9 +20,9 @@ from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from itertools import pairwise
 from pathlib import Path
 
-from .config import MINUTES_PER_DAY, ReportConfig
+from .config import MINUTES_PER_DAY, ReportConfig, TriggerConfig
 from .metrics import OUTCOME_ERROR, OUTCOME_SUCCESS, Metrics, default_metrics
-from .models import DETECTION_KEYS, Camera, slugify
+from .models import DETECTION_KEYS, Camera, is_trigger_kind, kind_name, slugify, trigger_kind
 from .render import (
     ALWAYS_RENDERED,
     BAND_CLASSES,
@@ -138,12 +138,34 @@ class SheetWriter:
         store: EventStore,
         reports: ReportConfig,
         cameras: Callable[[], Sequence[Camera]] = lambda: (),
+        triggers: Sequence[TriggerConfig] = (),
         clock: Callable[[], datetime] = lambda: datetime.now(tz=UTC),
         metrics: Metrics | None = None,
     ) -> None:
         self._store = store
         self._reports = reports
         self._cameras = cameras
+        #: The triggers as configured *now*, which is what lets a lane be drawn
+        #: for one that has never fired and lets a lane be named rather than
+        #: spelled out of its slug. The history does not hold either fact, so a
+        #: day rebuilt after a trigger was renamed or deleted falls back on the
+        #: slug -- the sheet stays truthful about the past, it just gets less
+        #: helpful about it.
+        self._triggers = tuple(triggers)
+        #: ``trigger:<slug>`` -> the trigger, for the two questions the sheet
+        #: asks of one: what to call its lane, and which cameras it watches.
+        self._by_kind = {trigger_kind(trigger.key): trigger for trigger in self._triggers}
+        self._names = {kind: trigger.name for kind, trigger in self._by_kind.items()}
+        #: The ones whose answers are actually arriving, which is what earns a
+        #: lane on a day they have said nothing: switched on, and recorded. A
+        #: trigger that is neither keeps its name, for the answers it gave
+        #: while it was -- an empty lane for one that can never fill it would
+        #: be a promise the sheet cannot keep.
+        self._watching = {
+            kind: trigger
+            for kind, trigger in self._by_kind.items()
+            if trigger.enabled and trigger.record
+        }
         self._clock = clock
         self._metrics = metrics or default_metrics()
         self._warned_unmatched: set[str] = set()
@@ -197,7 +219,13 @@ class SheetWriter:
     # -- arithmetic -------------------------------------------------------
 
     def _track(
-        self, kind: str, camera_ids: Sequence[str], events: Sequence[StoredEvent], window: _Window
+        self,
+        kind: str,
+        camera_ids: Sequence[str],
+        events: Sequence[StoredEvent],
+        window: _Window,
+        *,
+        watched: bool = True,
     ) -> Track:
         wanted = set(camera_ids)
         mine = [event for event in events if event.kind == kind and event.camera_id in wanted]
@@ -224,10 +252,65 @@ class SheetWriter:
         )
         return Track(
             kind=kind,
+            label=self._label(kind),
             segments=segments,
             buckets=tuple(buckets),
             events=started_today,
             seconds=sum(end - start for start, end in spans),
+            watched=watched,
+        )
+
+    def _label(self, kind: str) -> str:
+        """A trigger's configured name, when we still have it. Else nothing."""
+        return self._names.get(kind, "")
+
+    def _trigger_kinds(
+        self, fired: set[str], camera_ids: Sequence[str], roster: _Roster
+    ) -> tuple[str, ...]:
+        """The trigger lanes this section gets, after its detection lanes.
+
+        Two sources, because neither alone is enough. A trigger watching these
+        cameras gets a lane whether or not it has ever matched -- the same
+        reason motion gets one on a quiet day: a lane that says nothing
+        happened is the answer. And a ``trigger:`` kind in the day's history
+        gets one whether or not it is still configured, because it did happen
+        and deleting the question does not unhappen the answer.
+
+        Ordered by the name on the lane, so the sheet does not reshuffle itself
+        when a trigger is renamed in ``config.yaml`` or when one of them
+        happens to fire for the first time halfway through a day.
+        """
+        kinds = {kind for kind in fired if is_trigger_kind(kind)}
+        kinds.update(
+            kind
+            for kind in self._watching
+            if self._watches(kind, camera_ids, roster, default=False)
+        )
+        return tuple(sorted(kinds, key=lambda kind: (self._track_name(kind).lower(), kind)))
+
+    def _track_name(self, kind: str) -> str:
+        return self._label(kind) or kind_name(kind)
+
+    def _watches(
+        self, kind: str, camera_ids: Sequence[str], roster: _Roster, *, default: bool = True
+    ) -> bool:
+        """Whether this lane's question was actually put to any of these cameras.
+
+        A trigger need not watch every camera in a group, and a lane that reads
+        "no events" on a camera nobody asked about would be the sheet telling
+        the same lie the ``unknown`` status exists to prevent. Those lanes are
+        drawn as not watched instead.
+
+        ``default`` is what to say about a kind that is not a trigger we hold:
+        a detection (always watched) or a trigger that has since been deleted,
+        where the history is the only evidence either way and claiming it was
+        never watched would be the worse guess.
+        """
+        trigger = self._by_kind.get(kind)
+        if trigger is None:
+            return default
+        return any(
+            trigger.selects(camera_id, roster.get(camera_id, "")) for camera_id in camera_ids
         )
 
     def _at(self, day: date, minute: int, window: _Window) -> float:
@@ -340,9 +423,13 @@ class SheetWriter:
             fired = {event.kind for event in events if event.camera_id in members}
             kinds = tuple(
                 kind for kind in DETECTION_KEYS if kind in ALWAYS_RENDERED or kind in fired
-            )
+            ) + self._trigger_kinds(fired, camera_ids, roster)
+            watched = {kind: self._watches(kind, camera_ids, roster) for kind in kinds}
             rows: list[Row] = []
-            total_tracks = {kind: self._track(kind, camera_ids, events, window) for kind in kinds}
+            total_tracks = {
+                kind: self._track(kind, camera_ids, events, window, watched=watched[kind])
+                for kind in kinds
+            }
             if len(camera_ids) > 1:
                 rows.append(
                     Row(
@@ -357,7 +444,14 @@ class SheetWriter:
                     Row(
                         label=roster[camera_id] if len(camera_ids) > 1 else "",
                         tracks=tuple(
-                            self._track(kind, [camera_id], events, window) for kind in kinds
+                            self._track(
+                                kind,
+                                [camera_id],
+                                events,
+                                window,
+                                watched=self._watches(kind, [camera_id], roster),
+                            )
+                            for kind in kinds
                         ),
                     )
                 )

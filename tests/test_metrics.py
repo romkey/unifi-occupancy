@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
 from conftest import camera_payload
-from unifi_occupancy.config import Config
+from unifi_occupancy.config import Config, ReportConfig, TriggerConfig
 from unifi_occupancy.metrics import (
     CONTENT_TYPE,
     NAMESPACE,
@@ -447,3 +449,42 @@ def test_describe_protect_copes_with_nothing_to_say(metrics: Metrics) -> None:
 
 def test_default_metrics_is_one_instance() -> None:
     assert default_metrics() is default_metrics()
+
+
+def _recording_config(config: Config, tmp_path: Path, **trigger: object) -> Config:
+    return replace(
+        config,
+        reports=ReportConfig(output_dir=tmp_path, database=tmp_path / "h.sqlite3"),
+        triggers=(TriggerConfig(name="Fire or smoke", prompt="?", **trigger),),  # type: ignore[arg-type]
+    )
+
+
+def test_a_recorded_trigger_reads_as_zero_edges_before_its_first_one(
+    config: Config, metrics: Metrics, tmp_path: Path
+) -> None:
+    metrics.describe_config(_recording_config(config, tmp_path))
+    text = metrics.render()
+
+    edges = samples(text, "unifi_occupancy_recorded_edges_total")
+    assert edges['{kind="trigger:fire_or_smoke",edge="start"}'] == 0
+    assert edges['{kind="trigger:fire_or_smoke",edge="end"}'] == 0
+    assert samples(text, "unifi_occupancy_feature_enabled")['{feature="trigger_history"}'] == 1
+
+
+def test_a_trigger_kept_out_of_the_history_primes_no_edges(
+    config: Config, metrics: Metrics, tmp_path: Path
+) -> None:
+    metrics.describe_config(_recording_config(config, tmp_path, record=False))
+    text = metrics.render()
+
+    assert '{kind="trigger:fire_or_smoke",edge="start"}' not in samples(
+        text, "unifi_occupancy_recorded_edges_total"
+    )
+    assert samples(text, "unifi_occupancy_feature_enabled")['{feature="trigger_history"}'] == 0
+
+
+def test_the_history_flag_is_off_without_the_sheets(config: Config, metrics: Metrics) -> None:
+    """Nowhere to write to, so nothing is being written, whatever the trigger says."""
+    metrics.describe_config(replace(config, triggers=(TriggerConfig(name="Fire", prompt="?"),)))
+
+    assert metrics.feature_enabled.value(feature="trigger_history") == 0

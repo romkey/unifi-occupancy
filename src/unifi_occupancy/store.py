@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -167,18 +167,51 @@ class EventStore:
             (_epoch(at), camera_id, kind, _epoch(at)),
         )
 
-    def close_open_events(self, hold_seconds: float) -> int:
+    def close_open_events(
+        self,
+        hold_seconds: float,
+        holds: Mapping[str, float] | None = None,
+        *,
+        now: datetime | None = None,
+    ) -> int:
         """Close events left open by a crash or a restart.
 
         An event the process never saw end would otherwise stretch across the
         whole outage; the detection would in fact have decayed ``hold_seconds``
         after its last sighting, so that is where it is cut.
+
+        ``holds`` overrides that per kind, because the detection hold is the
+        wrong ruler for everything in this table. A detection decays 30 seconds
+        after it was last seen; a custom trigger that matched is believed until
+        a later check says otherwise, and those checks are minutes apart. Cut
+        with the detection hold, a fire that burned for an hour is stored as a
+        30-second blip -- so a trigger is cut one of *its own* intervals after
+        it opened instead, the same shape of answer as the detection's and for
+        the same reason: it is the last moment we have any evidence for.
+
+        Never later than ``now``, whichever hold applies. An event that opened
+        shortly before the restart has a hold reaching into the future, and a
+        row ending in the future is worse than one ending early: the first
+        check after startup opens a *second* row, and a later clear closes
+        that one, leaving the first still running to a time that has not
+        happened. The sheet would draw the trigger as present after it had
+        gone -- so the cut lands at the last moment we were looking, and the
+        gap between the two rows is left as the gap it really was.
         """
+        moment = _epoch(now or datetime.now(tz=UTC))
+        closed = 0
+        for kind, hold in (holds or {}).items():
+            cursor = self._db.execute(
+                "UPDATE events SET ended_at = min(started_at + ?, ?)"
+                " WHERE ended_at IS NULL AND kind = ?",
+                (hold, moment, kind),
+            )
+            closed += cursor.rowcount or 0
         cursor = self._db.execute(
-            "UPDATE events SET ended_at = started_at + ? WHERE ended_at IS NULL",
-            (hold_seconds,),
+            "UPDATE events SET ended_at = min(started_at + ?, ?) WHERE ended_at IS NULL",
+            (hold_seconds, moment),
         )
-        closed = cursor.rowcount or 0
+        closed += cursor.rowcount or 0
         if closed:
             logger.info("closed %d event(s) left open by a previous run", closed)
         return closed

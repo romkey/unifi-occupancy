@@ -519,6 +519,12 @@ class TriggerSink(Protocol):
     ) -> None: ...
 
 
+class TriggerLog(Protocol):
+    """Where answers are kept -- :class:`~unifi_occupancy.recorder.EventRecorder`."""
+
+    def record_trigger(self, camera: Camera, result: TriggerResult) -> None: ...
+
+
 class TriggerWatcher:
     """Puts a group of triggers' questions to their cameras on a schedule.
 
@@ -547,6 +553,7 @@ class TriggerWatcher:
         clock: Callable[[], float] = time.monotonic,
         is_current: Callable[[str], bool] | None = None,
         metrics: Metrics | None = None,
+        recorder: TriggerLog | None = None,
     ) -> None:
         triggers = (config,) if isinstance(config, TriggerConfig) else tuple(config)
         if not triggers:
@@ -558,6 +565,7 @@ class TriggerWatcher:
         self._snapshots = snapshots
         self._sink = sink
         self._judge = judge
+        self._recorder = recorder
         self._sleep = sleep
         self._clock = clock
         self._is_current = is_current
@@ -764,7 +772,21 @@ class TriggerWatcher:
             for result, image in checked:
                 results.append(result)
                 await self._sink.publish_trigger(camera, result, image)
+                self._record(camera, result)
         return results
+
+    def _record(self, camera: Camera, result: TriggerResult) -> None:
+        """Write the answer to the history, after it has been published.
+
+        After, not before, for the reason the recorder exists at all: the log
+        is meant to say what the broker was told, so an answer that never got
+        there does not belong in it.
+        """
+        if self._recorder is None:
+            return
+        if not self._by_key(result.trigger).record:
+            return
+        self._recorder.record_trigger(camera, result)
 
     async def run_forever(self, cameras: Callable[[], Sequence[Camera]]) -> None:
         """Sweep, wait out the interval, sweep again, until cancelled."""

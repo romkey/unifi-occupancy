@@ -81,6 +81,70 @@ def test_open_events_are_closed_at_the_hold_time(store: EventStore) -> None:
     assert store.close_open_events(30.0) == 0
 
 
+def test_a_trigger_left_open_is_cut_at_its_own_interval(store: EventStore) -> None:
+    """The detection hold is the wrong ruler: it would store an hour as a blip."""
+    store.start_event("cam-1", "Front Door", "motion", T0)
+    store.start_event("cam-1", "Front Door", "trigger:fire_or_smoke", T0)
+
+    assert store.close_open_events(30.0, {"trigger:fire_or_smoke": 900.0}) == 2
+
+    ends = {
+        event.kind: event.ended_at for event in store.events_between(T0, T0 + timedelta(hours=2))
+    }
+    assert ends["motion"] == T0 + timedelta(seconds=30)
+    assert ends["trigger:fire_or_smoke"] == T0 + timedelta(minutes=15)
+
+
+def test_a_kind_with_no_hold_of_its_own_falls_back_to_the_default(store: EventStore) -> None:
+    """A trigger from a run that asked a question this one does not."""
+    store.start_event("cam-1", "Front Door", "trigger:gone_away", T0)
+
+    assert store.close_open_events(30.0, {"trigger:fire_or_smoke": 900.0}) == 1
+
+    (event,) = store.events_between(T0, T0 + timedelta(hours=1))
+    assert event.ended_at == T0 + timedelta(seconds=30)
+
+
+def test_a_hold_reaching_past_now_is_cut_at_now(store: EventStore) -> None:
+    """A row ending in the future would claim a time that has not happened."""
+    kind = "trigger:fire_or_smoke"
+    store.start_event("cam-1", "Front Door", kind, T0)
+    restart = T0 + timedelta(minutes=2)
+
+    assert store.close_open_events(30.0, {kind: 900.0}, now=restart) == 1
+
+    (event,) = store.events_between(T0, T0 + timedelta(hours=1))
+    assert event.ended_at == restart
+
+
+def test_a_detection_is_not_future_dated_either(store: EventStore) -> None:
+    store.start_event("cam-1", "Front Door", "motion", T0)
+    restart = T0 + timedelta(seconds=5)
+
+    store.close_open_events(30.0, now=restart)
+
+    (event,) = store.events_between(T0, T0 + timedelta(hours=1))
+    assert event.ended_at == restart
+
+
+def test_a_restart_mid_match_leaves_two_bars_and_a_real_gap(store: EventStore) -> None:
+    """The failure this guards: the first bar outlasting the one that replaced it."""
+    kind = "trigger:fire_or_smoke"
+    store.start_event("cam-1", "Front Door", kind, T0)
+    restart = T0 + timedelta(minutes=2)
+    store.close_open_events(30.0, {kind: 900.0}, now=restart)
+    # The first check after startup still matches, so a second row opens.
+    store.start_event("cam-1", "Front Door", kind, T0 + timedelta(minutes=3))
+    store.end_event("cam-1", kind, T0 + timedelta(minutes=4))
+
+    first, second = store.events_between(T0, T0 + timedelta(hours=1))
+    assert first.ended_at == restart
+    assert second.ended_at == T0 + timedelta(minutes=4)
+    # Nothing is drawn over the minute nobody was looking, and nothing outlives
+    # the clear that ended the condition.
+    assert first.ended_at is not None and first.ended_at < second.started_at
+
+
 def test_ending_an_event_that_never_started_is_harmless(store: EventStore) -> None:
     store.end_event("cam-1", "motion", T0)
 

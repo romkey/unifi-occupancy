@@ -32,7 +32,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import Final
 
 from . import __version__
-from .models import DETECTION_KEYS, Camera
+from .models import DETECTION_KEYS, Camera, trigger_kind
 from .state import CameraState
 
 try:  # pragma: no cover - absent only on Windows, which this does not target
@@ -622,7 +622,7 @@ class Metrics:
         # -- the occupancy history and sheets --------------------------------
         self.recorded_edges = registry.counter(
             "recorded_edges_total",
-            "Detection edges written to the history database, by kind and edge.",
+            "Detection and trigger edges written to the history database, by kind and edge.",
             ("kind", "edge"),
         )
         self.recorder_failures = registry.counter(
@@ -692,6 +692,14 @@ class Metrics:
             float(any(trigger.publish_snapshot for trigger in config.active_triggers)),
             feature="trigger_snapshots",
         )
+        self.feature_enabled.set(
+            float(
+                reports is not None
+                and reports.enabled
+                and any(trigger.record for trigger in config.active_triggers)
+            ),
+            feature="trigger_history",
+        )
         self.feature_enabled.set(float(config.metrics.enabled), feature="metrics")
         self.configured_seconds.set(config.protect.poll_interval, setting="poll_interval")
         self.configured_seconds.set(config.detection_hold_seconds, setting="detection_hold")
@@ -717,6 +725,12 @@ class Metrics:
             self.configured_seconds.set(
                 trigger.interval_seconds, setting=f"trigger_{trigger.key}_interval"
             )
+            if trigger.record:
+                # So a trigger that is being written to the history reads as
+                # zero edges before its first one, not as absent -- the same
+                # reason the detection kinds are primed.
+                for edge in ("start", "end"):
+                    self.recorded_edges.prime(kind=trigger_kind(trigger.key), edge=edge)
 
     def describe_protect(
         self,

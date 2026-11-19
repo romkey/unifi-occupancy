@@ -17,7 +17,7 @@ from datetime import date, datetime
 from html import escape
 
 from .config import ReportConfig
-from .models import MOTION, PERSON, kind_for
+from .models import MOTION, PERSON, is_trigger_kind, kind_class, kind_name
 
 #: Detection kinds that always get a track, even on a day with nothing in them.
 ALWAYS_RENDERED: tuple[str, ...] = (MOTION, PERSON)
@@ -68,10 +68,21 @@ class Track:
     buckets: tuple[int, ...] = ()
     events: int = 0
     seconds: float = 0.0
+    #: What to call this lane. Empty for a detection, which names itself, and
+    #: for a trigger whose name is no longer known.
+    label: str = ""
+    #: False when nothing on this row was ever asked this question: a camera
+    #: the trigger does not watch. An empty lane then means "not asked", which
+    #: is not the same as "nothing happened" and must not read like it.
+    watched: bool = True
 
     @property
     def name(self) -> str:
-        return kind_for(self.kind).name
+        return self.label or kind_name(self.kind)
+
+    @property
+    def css(self) -> str:
+        return kind_class(self.kind)
 
 
 @dataclass(frozen=True)
@@ -149,6 +160,7 @@ DARK_VARS = """
   --bg: #15161a; --fg: #e9e7e4; --muted: #99948e; --line: #2b2d33;
   --card: #1c1e23; --shadow: rgba(0, 0, 0, .35);
   --motion: #e79a41; --person: #6ca8e8; --now: #4cc273; --hover: #ff5d52;
+  --trigger: #b084e8;
   --b0: rgba(255, 255, 255, .105); --b1: rgba(255, 255, 255, .050);
   --b2: rgba(255, 255, 255, .011); --b3: rgba(255, 255, 255, .078);
   --b4: rgba(255, 255, 255, .030); --b5: rgba(255, 255, 255, .062);
@@ -263,6 +275,7 @@ STYLE = """
   --bg: #fbfaf8; --fg: #1c1b19; --muted: #6d6964; --line: #e4dfd8;
   --card: #ffffff; --shadow: rgba(28, 27, 25, .06);
   --motion: #c0711c; --person: #2566a4; --now: #1f8a4c; --hover: #d2342a;
+  --trigger: #6f42c1;
   --b0: rgba(28, 27, 25, .115); --b1: rgba(28, 27, 25, .055);
   --b2: rgba(28, 27, 25, .014); --b3: rgba(28, 27, 25, .085);
   --b4: rgba(28, 27, 25, .034); --b5: rgba(28, 27, 25, .070);
@@ -345,6 +358,10 @@ section.group:target { border-color: var(--person); }
 .motion .seg, .motion .bk { background: var(--motion); }
 .person .seg, .person .bk { background: var(--person); }
 .siren .seg, .siren .bk, .smoke .seg, .smoke .bk { background: #c0392b; }
+/* Every custom trigger shares one colour: a sheet may carry any number of
+   them and each lane is labelled anyway. */
+.trigger .seg, .trigger .bk { background: var(--trigger); }
+.track.unwatched .lane { opacity: .55; }
 .quiet { position: absolute; inset: 0; display: flex; align-items: center;
   justify-content: center; font-size: .68rem; color: var(--muted); }
 
@@ -393,6 +410,7 @@ section.group:target { border-color: var(--person); }
   flex: none; }
 .legend .motion .sw { background: var(--motion); }
 .legend .person .sw { background: var(--person); }
+.legend .trigger .sw { background: var(--trigger); }
 .legend .per { display: inline-flex; align-items: center; gap: .35rem; }
 .legend .per .sw { border: 1px solid var(--line); }
 .per .sw.i0 { background: var(--b0); } .per .sw.i1 { background: var(--b1); }
@@ -472,6 +490,27 @@ def _bands_html(bands: Sequence[BandSpan]) -> str:
     )
 
 
+def _names(section: Section) -> dict[str, str]:
+    """Kind -> what its lane is called, taken from the lanes themselves.
+
+    :class:`Section` counts its kinds but does not name them, and a trigger's
+    name is not derivable from its kind. The tracks carry it, so the summary
+    line and the card at the top of the page read it back off them rather than
+    making the section repeat itself.
+    """
+    return {track.kind: track.name for row in section.rows for track in row.tracks}
+
+
+def _totals(section: Section) -> list[tuple[str, int]]:
+    """``(name, count)`` for the kinds worth printing in a summary."""
+    names = _names(section)
+    return [
+        (names.get(kind) or kind_name(kind), count)
+        for kind, count in section.totals.items()
+        if kind in ALWAYS_RENDERED or count
+    ]
+
+
 def _track_html(track: Track, bands_html: str, peak: int) -> str:
     segments = "".join(
         f'<i class="seg" style="left:{_pct(segment.start)}%;'
@@ -489,14 +528,17 @@ def _track_html(track: Track, bands_html: str, peak: int) -> str:
             for index, value in enumerate(track.buckets)
             if value > 0
         )
-    quiet = "" if track.events else '<span class="quiet">no events</span>'
-    summary = (
-        f"{_plural(track.events, 'event')} · {_duration(track.seconds)}"
-        if track.events
-        else "quiet"
-    )
+    if track.events:
+        quiet = ""
+        summary = f"{_plural(track.events, 'event')} · {_duration(track.seconds)}"
+    elif track.watched:
+        quiet = '<span class="quiet">no events</span>'
+        summary = "quiet"
+    else:
+        quiet = '<span class="quiet">not watched</span>'
+        summary = "not watched"
     return (
-        f'<div class="track {escape(track.kind)}">'
+        f'<div class="track {escape(track.css)}{"" if track.watched else " unwatched"}">'
         f'<div class="tname"><b>{escape(track.name)}</b> <span>{escape(summary)}</span></div>'
         f'<div class="lane">{bands_html}{segments}{quiet}</div>'
         f'<div class="lane den">{bands_html}{buckets}</div>'
@@ -518,7 +560,7 @@ def _row_html(row: Row, bands_html: str, peak: int) -> str:
 def _now_line(at: float, label: str) -> str:
     """The green rule itself, placed in a column that spans the tracks."""
     title = f"Updated to {label}" if label else "Updated to here"
-    return f'<i class="now" style="left:{_pct(at)}%" ' f'title="{escape(title, quote=True)}"></i>'
+    return f'<i class="now" style="left:{_pct(at)}%" title="{escape(title, quote=True)}"></i>'
 
 
 def _now_html(sheet: DaySheet) -> str:
@@ -565,11 +607,7 @@ def _section_html(
     # The rows and the axis under them are one chart, so the hover rule can run
     # from the top lane down past the hour labels as a single cut.
     rows = f'<div class="chart"{chart_data}>{rows}{axis}{_hover_html()}</div>'
-    totals = " · ".join(
-        f"{escape(kind_for(kind).name)} {count}"
-        for kind, count in section.totals.items()
-        if kind in ALWAYS_RENDERED or count
-    )
+    totals = " · ".join(f"{escape(name)} {count}" for name, count in _totals(section))
     return (
         f'<section class="group" id="{escape(section.key, quote=True)}">'
         f'<div class="ghead"><h2>{escape(section.name)}</h2>'
@@ -581,9 +619,18 @@ def _section_html(
 
 def _legend_html(bands: Sequence[BandSpan], peak: int, sheet: DaySheet) -> str:
     kinds = "".join(
-        f'<span class="k {escape(kind)}"><i class="sw"></i>{escape(kind_for(kind).name)}</span>'
+        f'<span class="k {escape(kind)}"><i class="sw"></i>{escape(kind_name(kind))}</span>'
         for kind in ALWAYS_RENDERED
     )
+    if any(
+        is_trigger_kind(track.kind)
+        for section in sheet.sections
+        for row in section.rows
+        for track in row.tracks
+    ):
+        # One entry for all of them: the colour is what needs explaining, and
+        # the lanes are already named where they are drawn.
+        kinds += '<span class="k trigger"><i class="sw"></i>custom triggers</span>'
     seen: list[str] = []
     periods: list[str] = []
     for band in bands:
@@ -604,7 +651,7 @@ def _legend_html(bands: Sequence[BandSpan], peak: int, sheet: DaySheet) -> str:
         ""
         if sheet.now is None
         else '<span class="k now-k"><i class="sw"></i>'
-        f'now{" " + escape(sheet.now_label) if sheet.now_label else ""}'
+        f"now{' ' + escape(sheet.now_label) if sheet.now_label else ''}"
         " \u2014 updated to here</span>"
     )
     return (
@@ -667,11 +714,7 @@ def render_day(sheet: DaySheet, reports: ReportConfig) -> str:
     cards = "".join(
         f'<a class="card" href="#{escape(section.key, quote=True)}">'
         f'<b>{escape(section.name)}</b><div class="n">'
-        + "<br>".join(
-            f"{escape(kind_for(kind).name)} <span>{count}</span>"
-            for kind, count in section.totals.items()
-            if kind in ALWAYS_RENDERED or count
-        )
+        + "<br>".join(f"{escape(name)} <span>{count}</span>" for name, count in _totals(section))
         + "</div></a>"
         for section in sheet.sections
     )
@@ -690,8 +733,8 @@ def render_day(sheet: DaySheet, reports: ReportConfig) -> str:
     body = (
         f"<h1>{escape(reports.title)} — {escape(heading)}</h1>\n"
         f'<p class="sub">Updated {escape(generated)} · rewritten every '
-        f'{_plural(reports.refresh_minutes, "minute")}</p>\n'
-        f'{"".join(nav)}\n'
+        f"{_plural(reports.refresh_minutes, 'minute')}</p>\n"
+        f"{''.join(nav)}\n"
         f'<div class="cards">{cards}</div>\n'
         f"{sections}\n"
         f"{_legend_html(sheet.bands, sheet.peak_bucket, sheet)}"
@@ -727,7 +770,7 @@ def render_index(
             cells.append(f"<td{klass}>{motion} / {person}</td>")
         rows.append(
             f'<tr><td><a href="{entry.href}">{entry.day.isoformat()}</a></td>'
-            f'{"".join(cells)}'
+            f"{''.join(cells)}"
             f'<td class="tot">{entry.total(MOTION)} / {entry.total(PERSON)}</td></tr>'
         )
 
@@ -740,7 +783,7 @@ def render_index(
         f'<nav class="days">{_theme_html()}</nav>\n'
         f'<div class="scroll"><table class="index">'
         f"<thead><tr><th>Day</th>{head}<th>All</th></tr></thead>"
-        f'<tbody>{"".join(rows)}</tbody></table></div>'
+        f"<tbody>{''.join(rows)}</tbody></table></div>"
     )
     return _page(reports.title, body)
 

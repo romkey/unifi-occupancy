@@ -11,10 +11,15 @@ from unifi_occupancy.models import (
     SIREN,
     SMOKE,
     classify,
+    is_trigger_kind,
+    kind_class,
+    kind_name,
     parse_camera,
     parse_cameras,
     parse_event,
     slugify,
+    trigger_key,
+    trigger_kind,
 )
 
 
@@ -200,3 +205,31 @@ def test_parse_event_without_item_wrapper() -> None:
 )
 def test_parse_event_ignores_irrelevant_frames(payload: object) -> None:
     assert parse_event(payload) is None
+
+
+def test_a_trigger_kind_round_trips_through_its_slug() -> None:
+    kind = trigger_kind("fire_or_smoke")
+
+    assert kind == "trigger:fire_or_smoke"
+    assert is_trigger_kind(kind)
+    assert trigger_key(kind) == "fire_or_smoke"
+
+
+def test_a_detection_kind_is_not_a_trigger_kind() -> None:
+    assert not is_trigger_kind(MOTION)
+    assert trigger_key(MOTION) is None
+    assert trigger_key("trigger:") is None
+
+
+def test_a_kind_names_itself_for_the_sheets() -> None:
+    assert kind_name(MOTION) == "Motion"
+    # The fallback: a trigger whose name is no longer in config.yaml is read
+    # back out of its slug rather than printed as one.
+    assert kind_name(trigger_kind("fire_or_smoke")) == "Fire Or Smoke"
+
+
+def test_every_trigger_shares_one_css_class() -> None:
+    """A slug is not a class name, and a sheet may carry any number of them."""
+    assert kind_class(MOTION) == MOTION
+    assert kind_class(trigger_kind("fire_or_smoke")) == "trigger"
+    assert kind_class(trigger_kind("gate_open")) == "trigger"

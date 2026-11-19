@@ -75,6 +75,53 @@ def kind_for(key: str) -> DetectionKind:
     return _KIND_BY_KEY[key]
 
 
+#: Prefix that marks a history row as a custom trigger rather than one of the
+#: four detections above. The same prefix names a trigger's job in the metrics,
+#: so ``trigger:fire_or_smoke`` reads the same way wherever it turns up.
+TRIGGER_PREFIX = "trigger:"
+
+
+def trigger_kind(key: str) -> str:
+    """The history ``kind`` for a trigger, from its slug."""
+    return f"{TRIGGER_PREFIX}{key}"
+
+
+def trigger_key(kind: str) -> str | None:
+    """The trigger slug inside a ``kind``, or ``None`` for a detection kind."""
+    if not kind.startswith(TRIGGER_PREFIX):
+        return None
+    return kind[len(TRIGGER_PREFIX) :] or None
+
+
+def is_trigger_kind(kind: str) -> bool:
+    return trigger_key(kind) is not None
+
+
+def kind_name(kind: str) -> str:
+    """A display name for any kind the history may hold.
+
+    Detections name themselves. A trigger's real name lives in ``config.yaml``
+    and not in the history, so this is the fallback used when the sheet is
+    built without it: rebuilding an old day, or a day whose trigger has since
+    been renamed or deleted. Derived from the slug rather than guessed at, so
+    it is recognisably the same trigger.
+    """
+    key = trigger_key(kind)
+    if key is None:
+        return kind_for(kind).name
+    return key.replace("_", " ").strip().title() or "Trigger"
+
+
+def kind_class(kind: str) -> str:
+    """The CSS class a kind is drawn with.
+
+    Triggers share one class, and one colour: a sheet may carry any number of
+    them, their slugs are not valid class names, and the track is labelled
+    anyway. The four detections keep a class each.
+    """
+    return "trigger" if is_trigger_kind(kind) else kind
+
+
 def classify(value: str) -> str | None:
     """Map a Protect detection type string onto one of our keys, if we track it."""
     for kind in DETECTION_KINDS:

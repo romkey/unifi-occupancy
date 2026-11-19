@@ -5,6 +5,12 @@ detection is on and when it has decayed; this watches the same snapshots the
 publisher sends and writes the edges -- off-to-on and on-to-off -- into the
 store. Deriving history from exactly what was published means a sheet can never
 disagree with what Home Assistant was told at the time.
+
+Custom triggers go in the same log, through :meth:`EventRecorder.record_trigger`
+and under a ``trigger:`` kind. They are a detection in every way that matters
+here: a boolean that goes on and later goes off, on a camera, at a time. Giving
+them a table of their own would have bought nothing and cost the sheets their
+one way of reading history.
 """
 
 from __future__ import annotations
@@ -12,11 +18,15 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from .metrics import Metrics, default_metrics
-from .models import DETECTION_KEYS
+from .models import DETECTION_KEYS, Camera, trigger_kind
 from .state import CameraState
 from .store import EventStore
+
+if TYPE_CHECKING:  # pragma: no cover - a type, not a dependency
+    from .triggers import TriggerResult
 
 logger = logging.getLogger(__name__)
 
@@ -58,27 +68,58 @@ class EventRecorder:
         now = self._clock()
         self._note(camera.id, camera.name, now)
         for kind in self._kinds:
-            pair = (camera.id, kind)
-            active = state.active(kind)
-            if active == (pair in self._active):
-                continue
-            try:
-                if active:
-                    self._store.start_event(camera.id, camera.name, kind, now)
-                else:
-                    self._store.end_event(camera.id, kind, now)
-            except Exception as exc:  # noqa: BLE001 - history is not worth a crash
-                self._metrics.record_recorder_failure("event")
-                if not self._complained:
-                    logger.warning("could not record detection history: %s", exc)
-                    self._complained = True
+            if not self._edge(camera, kind, active=state.active(kind), now=now):
                 return
-            self._complained = False
-            self._metrics.record_edge(kind, start=active)
+
+    def record_trigger(self, camera: Camera, result: TriggerResult) -> None:
+        """Write a custom trigger's edge, the same way a detection's is written.
+
+        Only an answer worth publishing as a boolean is worth writing down.
+        ``unknown`` -- no snapshot, no endpoint, a reply nobody could read --
+        leaves the boolean exactly as it was, so it has to leave the history
+        exactly as it was too: a sheet showing a trigger going clear at the
+        moment the vision server fell over would be reporting an answer nobody
+        ever gave.
+
+        Nothing the model *said* is kept. The row carries the trigger, the
+        camera and the two times, like every other row in the log; the
+        explanation stays where it already was, in the attributes topic and in
+        the service log, and is not written to disk.
+        """
+        if not result.known:
+            return
+        now = self._clock()
+        self._note(camera.id, camera.name, now)
+        self._edge(camera, trigger_kind(result.trigger), active=result.matched, now=now)
+
+    def _edge(self, camera: Camera, kind: str, *, active: bool, now: datetime) -> bool:
+        """Write one edge if this is one. False when the store would not take it.
+
+        A failure is reported once and then swallowed; the caller stops only so
+        that a sweep over every kind does not log the same dead disk four times
+        over.
+        """
+        pair = (camera.id, kind)
+        if active == (pair in self._active):
+            return True
+        try:
             if active:
-                self._active.add(pair)
+                self._store.start_event(camera.id, camera.name, kind, now)
             else:
-                self._active.discard(pair)
+                self._store.end_event(camera.id, kind, now)
+        except Exception as exc:  # noqa: BLE001 - history is not worth a crash
+            self._metrics.record_recorder_failure("event")
+            if not self._complained:
+                logger.warning("could not record detection history: %s", exc)
+                self._complained = True
+            return False
+        self._complained = False
+        self._metrics.record_edge(kind, start=active)
+        if active:
+            self._active.add(pair)
+        else:
+            self._active.discard(pair)
+        return True
 
     def _note(self, camera_id: str, camera_name: str, now: datetime) -> None:
         """Keep the roster current so quiet cameras still reach the sheets."""

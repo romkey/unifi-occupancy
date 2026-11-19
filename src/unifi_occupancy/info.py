@@ -98,6 +98,9 @@ def service_info_payload(
             "trigger_snapshots": any(
                 trigger.publish_snapshot for trigger in config.active_triggers
             ),
+            # Whether any trigger answer is being written to disk, which is
+            # the other thing about a trigger that outlives the moment.
+            "trigger_history": bool(_recorded(config)),
             "metrics": config.metrics.enabled,
         },
         "detections": list(DETECTION_KEYS),
@@ -118,6 +121,7 @@ def service_info_payload(
                 "model": trigger.model,
                 "publish_snapshot": trigger.publish_snapshot,
                 "batch": trigger.batch,
+                "record": trigger.record,
             }
             for trigger in config.active_triggers
         ]
@@ -130,6 +134,13 @@ def service_info_payload(
     if camera_count is not None:
         payload["cameras"] = camera_count
     return payload
+
+
+def _recorded(config: Config) -> tuple[str, ...]:
+    """Triggers whose answers reach the history, if the history is on at all."""
+    if config.reports is None or not config.reports.enabled:
+        return ()
+    return tuple(trigger.key for trigger in config.active_triggers if trigger.record)
 
 
 def camera_info_payload(camera: Camera) -> dict[str, Any]:

@@ -276,6 +276,7 @@ Each trigger takes:
 | `max_explanation_chars` | `200` | Trim length for the explanation |
 | `append_answer_format` | `true` | Append the JSON answer format to your prompt |
 | `batch` | `true` | Let this trigger share one call with others like it — see below |
+| `record` | `true` | Put the trigger's answers on the daily occupancy sheets — see below |
 
 The endpoint, key and model default to whatever the camera health check uses, so a local
 vision server configured once serves both; `VISION_API_BASE_URL`, `VISION_API_KEY` and
@@ -527,6 +528,61 @@ process for the endpoint you named. They are held in memory for one request and 
 published, logged or written to disk; what reaches your broker is a boolean and, at worst, a
 short sentence. Write no triggers and no snapshot is ever taken.
 
+### Triggers on the daily sheets
+
+A trigger's answers are a camera's history as much as its motion is, so they go in the same
+place. If you have the [daily occupancy sheets](#daily-occupancy-sheets) switched on, each
+trigger gets a **lane of its own on every camera it watches**, drawn next to that camera's
+motion and person lanes, measured the same way, on the same day:
+
+```
+Front Door
+  Motion         ▁▁▃▁▁▁▂▁▁   14 events · 9m 12s
+  Person         ▁▁▂▁▁▁▁▁▁    6 events · 7m 40s
+  Fire or smoke  ▁▁▁▁▁▁▁▁▁    quiet
+  Gate left open ▁▁▁▁▁▁█▁▁    1 event · 2h 14m
+```
+
+A match opens the bar and the next `clear` closes it, exactly as a detection's hold does,
+so the bar is how long the thing was *there*, not how often it was noticed. An `unknown` —
+no snapshot, no endpoint, a reply nobody could read — leaves the lane exactly as it leaves
+the boolean: a gap in the record is not an all-clear, and the sheet will not draw one.
+
+A bar left open by a crash or a restart is cut one of that trigger's own intervals after it
+opened, or at the moment the process stopped looking, whichever came first — that is the
+last moment anything is known about, since a match is believed until a later check
+contradicts it and the check that would have contradicted it never ran. A restart in the
+middle of a match therefore leaves two bars with a gap between them, which is what actually
+happened: nobody was looking.
+
+Four things follow from putting triggers in the detection log rather than a table of their
+own:
+
+- **A quiet lane is an answer.** A trigger that has watched all day and seen nothing gets
+  its lane anyway, the same way motion does, because "no fire today" is the thing you
+  wanted to know.
+- **A camera the trigger does not watch reads `not watched`**, not `no events`. A group's
+  lane shows the cameras in it that were actually asked; the others say so rather than
+  claiming a clean day they were never part of.
+- **Deleting a trigger does not unhappen its answers.** A day it fired on still draws its
+  lane when that day is rebuilt, labelled out of its slug — `Fire Or Smoke` rather than
+  `Fire or smoke` — since the name lived in `config.yaml` and the name is the only thing
+  lost. `enabled: false` keeps the name and stops the lane growing.
+- **Nothing the model said is kept.** The row holds the trigger, the camera and the two
+  times — the same five columns every other row in the log holds. The explanation stays
+  where it already was, on the attributes topic and in the service log, and is not written
+  to disk.
+
+Every trigger shares one colour on a sheet, since a page may carry any number of them and
+each lane is labelled where it is drawn.
+
+Set `record: false` on a trigger whose answers are nobody's business after the moment they
+are given, or `VISION_RECORD_TRIGGERS=false` for all of them at once. Switching it off
+stops new rows; the ones already written age out with `retention_days` like everything else
+in the log. With no `config.yaml` there are no sheets and no history, so there is nothing to
+opt out of — `features.trigger_history` in the `info` topic is the single answer to whether
+any of this is happening.
+
 ## Daily occupancy sheets
 
 Opt-in, and the switch is a file: create `config.yaml` and the service starts recording
@@ -563,7 +619,9 @@ detection:
 
 Behind both, the day is shaded into the **periods** you named — morning, afternoon, evening,
 night, or whatever divisions suit the place. Motion and person always get strips; siren and
-smoke are recorded too, and appear on a day they actually fired.
+smoke are recorded too, and appear on a day they actually fired. Any
+[custom trigger](#triggers-on-the-daily-sheets) you have written gets a strip after those,
+on each camera it watches.
 
 On the current day, a green vertical line runs down through every camera in a section at
 the time the sheet was last written: everything to the right of it is a day that has not
@@ -666,7 +724,9 @@ docker compose exec unifi-occupancy python -m unifi_occupancy --rebuild-sheets
 
 That reads the history and writes the pages; it needs neither the controller nor the
 broker. Cameras that have never fired are listed from the stored roster, so a rebuild looks
-the same as a live refresh.
+the same as a live refresh. It does read `config.yaml` and the `VISION_*` variables, since
+the trigger lanes are named and drawn from them — run it with the same environment the
+service runs with, which `docker compose exec` does for you.
 
 ## Prometheus metrics
 
@@ -739,6 +799,7 @@ prefixed `unifi_occupancy_`; the table leaves that off to stay readable.
 | `health_checks_total{camera,verdict}`, `health_check_duration_seconds`, `camera_health{camera,status}`, `health_last_check_timestamp_seconds{camera}` | The optional vision check: verdicts per camera, how long each took, when each was last looked at |
 | `trigger_checks_total{trigger,camera,answer}`, `trigger_check_duration_seconds{trigger}`, `trigger_state{trigger,camera,state}`, `trigger_last_check_timestamp_seconds{trigger,camera}` | Custom triggers: answers per trigger and camera, how long each check took, when each was last asked |
 | `trigger_batch_calls_total{outcome}` | Calls that asked several triggers at once. `unreadable` is one that fell back to separate calls |
+| `recorded_edges_total{kind,edge}` | Edges written to the history. A trigger's kind is `trigger:<name>` |
 | `trigger_snapshots_total{trigger,camera}` | Matching frames published to the broker. Stays absent unless a trigger has `publish_snapshot` on |
 | `recorded_edges_total{kind,edge}`, `recorder_failures_total{operation}`, `sheets_written_total` | The history database and the daily sheets |
 | `http_requests_total{path,status}`, `http_request_duration_seconds` | This endpoint itself |
@@ -875,6 +936,7 @@ groups and the daily sheets are YAML; see [above](#configuration).
 | `VISION_HIGH_QUALITY_SNAPSHOT` | `CAMERA_HEALTH_HIGH_QUALITY_SNAPSHOT` | Default snapshot quality |
 | `VISION_MAX_EXPLANATION_CHARS` | `CAMERA_HEALTH_MAX_EXPLANATION_CHARS` | Default explanation trim |
 | `VISION_BATCH_TRIGGERS` | `true` | `false` asks every trigger on its own, never combined |
+| `VISION_RECORD_TRIGGERS` | `true` | `false` keeps every trigger's answers off the daily sheets |
 | `METRICS_ENABLED` | `false` | Serve the Prometheus endpoint |
 | `METRICS_TOKEN` | unset | *Required* when the endpoint is on; at least 16 characters |
 | `METRICS_HOST` | `0.0.0.0` | Address to bind |
@@ -925,7 +987,7 @@ mosquitto_sub -h localhost -t 'unifi-occupancy/#' -v
 | `publisher.py` | Topic layout, change detection, retraction |
 | `metrics.py` | The counters, gauges and histograms, and the exposition format |
 | `exporter.py` | The token-protected `/metrics` HTTP endpoint |
-| `recorder.py` | Published state → detection edges worth keeping |
+| `recorder.py` | Published state and trigger answers → the edges worth keeping |
 | `store.py` | The SQLite detection history, camera roster and per-day summaries |
 | `report.py` | Grouping, the timeline arithmetic, the refresh schedule |
 | `render.py` | View models → self-contained HTML |
@@ -967,6 +1029,13 @@ controller and no broker.
 - The occupancy sheets record camera names, detection kinds and timestamps. Nothing else is
   stored, and nothing in `/var/www/html` is served by this process — it only writes the
   files. They are as public as you make them.
+- With the sheets on, a custom trigger's answers are recorded the same way and under the
+  same rules: the trigger, the camera and the two times, and never the sentence the model
+  wrote. `record: false` on a trigger, or `VISION_RECORD_TRIGGERS=false`, keeps its answers
+  out of the file; `features.trigger_history` in the `info` topic says whether any trigger
+  is being written down. Bear in mind that a trigger's lane says in plain words what was
+  being looked for, so a sheet is a more legible document than a list of motion times —
+  which matters mostly for where you serve it.
 
 ## License
 
