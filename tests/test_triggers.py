@@ -532,8 +532,7 @@ async def test_a_check_is_counted_and_timed() -> None:
     rendered = metrics.registry.render()
 
     assert (
-        'unifi_occupancy_trigger_checks_total{trigger="fire",camera="front_door",'
-        'answer="match"} 1'
+        'unifi_occupancy_trigger_checks_total{trigger="fire",camera="front_door",answer="match"} 1'
     ) in rendered
     assert (
         'unifi_occupancy_trigger_state{trigger="fire",camera="front_door",state="match"} 1'
@@ -723,6 +722,7 @@ def test_the_service_info_lists_the_triggers(config: Config) -> None:
             "model": "some-vision-model",
             "publish_snapshot": False,
             "batch": True,
+            "record": True,
         }
     ]
 
@@ -1632,3 +1632,129 @@ async def test_a_single_shaped_reply_does_not_mark_the_whole_group_unknown() -> 
 
     assert calls == ["batch", "single", "single"]
     assert [result.status for _, result in sink.published] == [MATCH, MATCH]
+
+
+class FakeRecorder:
+    def __init__(self) -> None:
+        self.recorded: list[tuple[str, str, str]] = []
+
+    def record_trigger(self, camera: Camera, result: TriggerResult) -> None:
+        self.recorded.append((camera.name, result.trigger, result.status))
+
+
+async def test_a_sweep_writes_its_answers_to_the_history() -> None:
+    recorder = FakeRecorder()
+    watcher = watcher_for(
+        FakeSnapshots(), FakeJudge(TriggerAnswer(MATCH)), FakeSink(), recorder=recorder
+    )
+
+    await watcher.sweep([CAMERA, OTHER])
+
+    assert recorder.recorded == [
+        ("Front Door", "fire", MATCH),
+        ("Back Yard", "fire", MATCH),
+    ]
+
+
+async def test_an_unknown_answer_still_reaches_the_recorder() -> None:
+    """Deciding what an ``unknown`` means to the history is the recorder's job."""
+    recorder = FakeRecorder()
+    watcher = watcher_for(
+        FakeSnapshots(None), FakeJudge(TriggerAnswer(MATCH)), FakeSink(), recorder=recorder
+    )
+
+    await watcher.sweep([CAMERA])
+
+    assert recorder.recorded == [("Front Door", "fire", UNKNOWN)]
+
+
+async def test_a_trigger_can_keep_its_answers_out_of_the_history() -> None:
+    recorder = FakeRecorder()
+    sink = FakeSink()
+    watcher = watcher_for(
+        FakeSnapshots(),
+        FakeJudge(TriggerAnswer(MATCH)),
+        sink,
+        config=[replace(FIRE, record=False), replace(FIRE, name="Gate", batch=False)],
+        recorder=recorder,
+    )
+
+    await watcher.sweep([CAMERA])
+
+    # Published either way; only the history is opted out of.
+    assert [result.trigger for _, result in sink.published] == ["fire", "gate"]
+    assert recorder.recorded == [("Front Door", "gate", MATCH)]
+
+
+async def test_a_watcher_without_a_recorder_just_publishes() -> None:
+    sink = FakeSink()
+    watcher = watcher_for(FakeSnapshots(), FakeJudge(TriggerAnswer(MATCH)), sink)
+
+    await watcher.sweep([CAMERA])
+
+    assert [result.status for _, result in sink.published] == [MATCH]
+
+
+async def test_an_answer_is_recorded_only_once_it_has_been_published() -> None:
+    """The log is meant to say what the broker was told, so order matters."""
+    order: list[str] = []
+    recorder = FakeRecorder()
+
+    class NotingSink(FakeSink):
+        async def publish_trigger(
+            self, camera: Camera, result: TriggerResult, snapshot: bytes | None = None
+        ) -> None:
+            order.append("published")
+            await super().publish_trigger(camera, result, snapshot)
+
+    class NotingRecorder(FakeRecorder):
+        def record_trigger(self, camera: Camera, result: TriggerResult) -> None:
+            order.append("recorded")
+            super().record_trigger(camera, result)
+
+    watcher = watcher_for(
+        FakeSnapshots(), FakeJudge(TriggerAnswer(MATCH)), NotingSink(), recorder=NotingRecorder()
+    )
+
+    await watcher.sweep([CAMERA])
+
+    assert order == ["published", "recorded"]
+    assert recorder.recorded == []
+
+
+def test_recording_is_on_unless_switched_off() -> None:
+    assert FIRE.record is True
+    assert TriggerConfig(name="X", prompt="y").record is True
+
+    parsed = parse_file_config("""
+        triggers:
+          - name: Fire
+            prompt: Is there a fire?
+          - name: Smoke
+            prompt: Is there smoke?
+            record: false
+        """).triggers
+
+    assert [trigger.record for trigger in parsed] == [True, False]
+
+
+def test_recording_can_be_switched_off_for_everything_at_once() -> None:
+    parsed = parse_file_config(
+        """
+        triggers:
+          - name: Fire
+            prompt: Is there a fire?
+          - name: Smoke
+            prompt: Is there smoke?
+        """,
+        vision=VisionConfig(record=False),
+    ).triggers
+
+    assert [trigger.record for trigger in parsed] == [False, False]
+
+
+def test_recording_does_not_split_a_batch() -> None:
+    """It is applied after the answer comes back, so it cannot constrain a call."""
+    pair = (FIRE, replace(FIRE, name="Smoke", record=False))
+
+    assert [len(group) for group in group_triggers(pair)] == [2]

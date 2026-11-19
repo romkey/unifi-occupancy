@@ -18,7 +18,6 @@ from .config import (
     ReportConfig,
     load_config,
     load_file_config,
-    load_report_config,
 )
 from .report import SheetWriter
 from .store import EventStore
@@ -55,16 +54,20 @@ def rebuild_sheets() -> int:
     """
     path = Path(os.environ.get("CONFIG_FILE") or DEFAULT_CONFIG_FILE)
     try:
-        reports: ReportConfig | None = load_report_config(path)
+        # The whole file, not just ``reports:``: the triggers are what name
+        # their own lanes on the sheets, so a rebuild that skipped them would
+        # label every trigger lane out of its slug.
+        from_file = load_file_config(path)
     except ConfigError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
         return 2
+    reports: ReportConfig | None = from_file.reports
     if reports is None:
         print(f"no config file at {path}; nothing to rebuild", file=sys.stderr)
         return 2
 
     with EventStore(reports.database) as store:
-        days = SheetWriter(store, reports).rebuild()
+        days = SheetWriter(store, reports, triggers=from_file.triggers).rebuild()
     logger.info("rebuilt %d day(s) into %s", days, reports.output_dir)
     return 0
 

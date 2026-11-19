@@ -121,6 +121,13 @@ groups:
 #     # On by default; this turns it off for a prompt you would rather the
 #     # model considered on its own.
 #     batch: true
+#     # Put this trigger's answers on the daily sheets: a lane on the
+#     # timeline of every camera it watches, where a match opens the bar and
+#     # the clear closes it. On by default wherever the sheets are on. Only
+#     # the trigger, the camera and the two times are written -- never the
+#     # sentence the model wrote. Set it false for a question whose answers
+#     # should not outlive the moment they were given.
+#     record: true
 #
 #   - name: Gate left open
 #     prompt: Is the driveway gate standing open?

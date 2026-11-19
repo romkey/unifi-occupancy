@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from pathlib import Path
 
 from conftest import FakeTransport, camera_payload
 from unifi_occupancy import __version__
-from unifi_occupancy.config import Config
+from unifi_occupancy.config import Config, ReportConfig, TriggerConfig
 from unifi_occupancy.discovery import device_block
 from unifi_occupancy.info import camera_info_payload, console_info, service_info_payload
 from unifi_occupancy.models import MOTION, PERSON, SMOKE, parse_camera
@@ -62,6 +63,7 @@ def test_service_info_reports_versions_and_features(config: Config) -> None:
         "camera_health": False,
         "custom_triggers": False,
         "trigger_snapshots": False,
+        "trigger_history": False,
         "metrics": False,
     }
     assert payload["cameras"] == 3
@@ -296,3 +298,22 @@ async def test_attributes_carry_the_hardware_too(config: Config, transport: Fake
     attributes = json.loads(transport.payload_for("unifi-occupancy/front_door/attributes") or "{}")
     assert attributes["hardware"] == "UVC G4 Doorbell Pro"
     assert attributes["model"] == "camera"
+
+
+def test_the_info_topic_says_whether_answers_are_being_kept(config: Config, tmp_path: Path) -> None:
+    trigger = TriggerConfig(name="Fire or smoke", prompt="?")
+    reports = ReportConfig(output_dir=tmp_path, database=tmp_path / "h.sqlite3")
+
+    with_history = replace(config, reports=reports, triggers=(trigger,))
+    assert service_info_payload(with_history)["features"]["trigger_history"] is True
+    assert service_info_payload(with_history)["triggers"][0]["record"] is True
+
+    opted_out = replace(with_history, triggers=(replace(trigger, record=False),))
+    assert service_info_payload(opted_out)["features"]["trigger_history"] is False
+    assert service_info_payload(opted_out)["triggers"][0]["record"] is False
+
+    # No sheets, nowhere to write: the flag follows what is actually happening.
+    assert (
+        service_info_payload(replace(config, triggers=(trigger,)))["features"]["trigger_history"]
+        is False
+    )

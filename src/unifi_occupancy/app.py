@@ -293,6 +293,7 @@ async def _serve(
                 trigger_judge,
                 is_current=lambda camera_id: camera_id in service.cameras,
                 metrics=metrics,
+                recorder=recorder,
             )
             tasks.append(
                 asyncio.create_task(
@@ -337,6 +338,10 @@ async def _serve(
                 store,
                 config.reports,
                 cameras=lambda: list(service.cameras.values()),
+                # Every trigger, not only the enabled ones: a trigger switched
+                # off this morning still has this morning's answers in the log,
+                # and they should be labelled with the name it was asked under.
+                triggers=config.triggers,
                 metrics=metrics,
             )
             tasks.append(asyncio.create_task(writer.run_forever(), name="sheets"))

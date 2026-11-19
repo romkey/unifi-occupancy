@@ -6,7 +6,7 @@ from datetime import UTC, date, datetime
 import pytest
 
 from unifi_occupancy.config import ReportConfig
-from unifi_occupancy.models import MOTION, PERSON
+from unifi_occupancy.models import MOTION, PERSON, trigger_kind
 from unifi_occupancy.render import (
     AxisMark,
     BandSpan,
@@ -435,3 +435,69 @@ def test_the_index_has_no_cards_to_link_from() -> None:
     html = render_index((entry,), (("front", "Front"),), REPORTS, NOW)
 
     assert 'class="card"' not in html
+
+
+# -- custom trigger lanes ---------------------------------------------------
+
+
+FIRE_KIND = trigger_kind("fire_or_smoke")
+
+
+def trigger_section(**kwargs: object) -> Section:
+    track = Track(kind=FIRE_KIND, label="Fire or smoke", events=1, seconds=600.0, **kwargs)  # type: ignore[arg-type]
+    return Section(
+        key="front",
+        name="Front of house",
+        rows=(Row(label="Front Door", tracks=(Track(kind=MOTION), track)),),
+        totals={MOTION: 0, FIRE_KIND: 1},
+    )
+
+
+def test_a_trigger_lane_is_drawn_in_the_trigger_colour() -> None:
+    """Its slug is not a class name, so every trigger shares one."""
+    html = render_day(sheet(trigger_section()), REPORTS)
+
+    assert '<div class="track trigger">' in html
+    assert "trigger:fire_or_smoke" not in html
+    assert ".trigger .seg, .trigger .bk { background: var(--trigger); }" in html
+
+
+def test_a_trigger_lane_is_labelled_with_its_configured_name() -> None:
+    html = render_day(sheet(trigger_section()), REPORTS)
+
+    assert "<b>Fire or smoke</b>" in html
+
+
+def test_a_trigger_names_itself_from_its_slug_when_nothing_else_can() -> None:
+    bare = Section(
+        key="k", name="Shed", rows=(Row(label="", tracks=(Track(kind=FIRE_KIND),)),), totals={}
+    )
+
+    html = render_day(sheet(bare), REPORTS)
+
+    assert "<b>Fire Or Smoke</b>" in html
+
+
+def test_the_summary_line_counts_triggers_by_name() -> None:
+    html = render_day(sheet(trigger_section()), REPORTS)
+
+    assert "Fire or smoke 1" in html
+
+
+def test_an_unwatched_lane_says_so_rather_than_claiming_quiet() -> None:
+    unwatched = Section(
+        key="k",
+        name="Shed",
+        rows=(Row(label="", tracks=(Track(kind=FIRE_KIND, label="Fire", watched=False),)),),
+        totals={},
+    )
+
+    html = render_day(sheet(unwatched), REPORTS)
+
+    assert "not watched" in html
+    assert "no events" not in html
+
+
+def test_the_legend_explains_the_trigger_colour_only_when_one_is_drawn() -> None:
+    assert "custom triggers" in render_day(sheet(trigger_section()), REPORTS)
+    assert "custom triggers" not in render_day(sheet(section()), REPORTS)

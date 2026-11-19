@@ -401,3 +401,8 @@ def test_an_empty_path_falls_back_to_the_default() -> None:
     config = load_config(MINIMAL | environment)
 
     assert config.metrics.path == "/metrics"
+
+
+def test_the_history_can_be_switched_off_for_every_trigger_by_env() -> None:
+    assert load_config(MINIMAL).vision.record is True
+    assert load_config({**MINIMAL, "VISION_RECORD_TRIGGERS": "false"}).vision.record is False

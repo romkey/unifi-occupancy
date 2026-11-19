@@ -206,6 +206,8 @@ class VisionConfig:
     max_explanation_chars: int = 200
     #: Whether triggers that can share one call do.
     batch: bool = True
+    #: Whether trigger answers are written to the occupancy history.
+    record: bool = True
 
 
 #: Appended to every trigger prompt unless the trigger switches it off. The
@@ -265,6 +267,20 @@ class TriggerConfig:
     device_class: str | None = None
     #: Whether to append :data:`TRIGGER_ANSWER_FORMAT` to the prompt.
     append_answer_format: bool = True
+    #: Whether this trigger's answers are written to the occupancy history.
+    #:
+    #: On by default. A match opens a row in the same event log the detections
+    #: go in and the clear closes it, so the trigger gets a lane of its own on
+    #: the daily sheet for every camera it watches -- next to that camera's
+    #: motion and person lanes, measured the same way, on the same day. Nothing
+    #: the model said is kept: the row carries the trigger, the camera and the
+    #: two times, and the explanation stays in the attributes topic.
+    #:
+    #: Set it false for a trigger whose answers are nobody's business after the
+    #: moment they are given. Switching it off stops new rows; it does not
+    #: remove the ones already written, which age out with ``retention_days``
+    #: like everything else in the log.
+    record: bool = True
     #: Whether this trigger may share a vision call with others like it.
     #:
     #: On by default. Triggers that match on :attr:`batch_key` -- same
@@ -664,6 +680,7 @@ def _parse_triggers(raw: object, defaults: VisionConfig) -> tuple[TriggerConfig,
                 device_class=_yaml_optional_str(entry, "device_class", None, where),
                 append_answer_format=_yaml_bool(entry, "append_answer_format", True, where),
                 batch=_yaml_bool(entry, "batch", defaults.batch, where),
+                record=_yaml_bool(entry, "record", defaults.record, where),
             )
         )
     keys = [trigger.key for trigger in triggers]
@@ -903,6 +920,7 @@ def _vision_config(env: Mapping[str, str], health: HealthConfig) -> VisionConfig
             env, "VISION_MAX_EXPLANATION_CHARS", health.max_explanation_chars
         ),
         batch=_get_bool(env, "VISION_BATCH_TRIGGERS", True),
+        record=_get_bool(env, "VISION_RECORD_TRIGGERS", True),
     )
 
 
