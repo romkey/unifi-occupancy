@@ -204,6 +204,8 @@ class VisionConfig:
     stagger_seconds: float = 5.0
     high_quality_snapshot: bool = False
     max_explanation_chars: int = 200
+    #: Whether triggers that can share one call do.
+    batch: bool = True
 
 
 #: Appended to every trigger prompt unless the trigger switches it off. The
@@ -263,6 +265,14 @@ class TriggerConfig:
     device_class: str | None = None
     #: Whether to append :data:`TRIGGER_ANSWER_FORMAT` to the prompt.
     append_answer_format: bool = True
+    #: Whether this trigger may share a vision call with others like it.
+    #:
+    #: On by default. Triggers that match on :attr:`batch_key` -- same
+    #: interval, same endpoint, same model, same snapshot quality -- are asked
+    #: together about one frame, which sends the image once instead of once per
+    #: trigger. Set it false for a trigger whose prompt is delicate enough that
+    #: it wants the model's whole attention, and it is asked on its own.
+    batch: bool = True
 
     @property
     def key(self) -> str:
@@ -287,6 +297,37 @@ class TriggerConfig:
     @property
     def completions_url(self) -> str:
         return f"{self.base_url.rstrip('/')}/chat/completions"
+
+    @property
+    def batchable(self) -> bool:
+        """Whether this trigger may be asked alongside others.
+
+        ``append_answer_format: false`` means the operator is writing the whole
+        prompt themselves, including how the answer should come back. A batched
+        call imposes its own answer format, so honouring both is impossible and
+        the explicit instruction wins: that trigger is always asked alone.
+        """
+        return self.batch and self.append_answer_format
+
+    @property
+    def batch_key(self) -> tuple[object, ...]:
+        """What has to match for two triggers to share a call.
+
+        The interval, because a shared call is a shared schedule. The endpoint,
+        key and model, because the call goes to exactly one of them. The
+        snapshot quality, because there is one frame. Everything else --
+        device class, explanation length, whether the frame is published -- is
+        applied per trigger after the answer comes back, so it does not
+        constrain the grouping.
+        """
+        return (
+            self.interval_minutes,
+            self.base_url,
+            self.api_key,
+            self.model,
+            self.request_timeout,
+            self.high_quality_snapshot,
+        )
 
     def selects(self, camera_id: str, camera_name: str) -> bool:
         """Whether this trigger watches the named camera.
@@ -622,6 +663,7 @@ def _parse_triggers(raw: object, defaults: VisionConfig) -> tuple[TriggerConfig,
                 publish_snapshot=_yaml_bool(entry, "publish_snapshot", False, where),
                 device_class=_yaml_optional_str(entry, "device_class", None, where),
                 append_answer_format=_yaml_bool(entry, "append_answer_format", True, where),
+                batch=_yaml_bool(entry, "batch", defaults.batch, where),
             )
         )
     keys = [trigger.key for trigger in triggers]
@@ -770,6 +812,49 @@ class Config:
         """The triggers that are actually switched on."""
         return tuple(trigger for trigger in self.triggers if trigger.enabled)
 
+    @property
+    def trigger_groups(self) -> tuple[tuple[TriggerConfig, ...], ...]:
+        """The active triggers, gathered into the calls they will share."""
+        return group_triggers(self.active_triggers)
+
+
+def group_triggers(
+    triggers: Sequence[TriggerConfig],
+) -> tuple[tuple[TriggerConfig, ...], ...]:
+    """Gather triggers into the vision calls they can share.
+
+    Triggers agreeing on :attr:`TriggerConfig.batch_key` are asked together
+    about one frame: one snapshot, one request, one answer covering all of
+    them. Since a vision request is mostly the image, three triggers sharing a
+    call cost about what one costs rather than three.
+
+    A trigger that opted out, or whose prompt format rules batching out, is a
+    group of one and is asked exactly as it was before. So is a trigger whose
+    interval, endpoint, model or snapshot quality nothing else shares.
+
+    Order is preserved: groups come out in the order their first trigger was
+    written in ``config.yaml``, and members in the order they were written.
+    An automation's behaviour should not depend on dictionary ordering, and a
+    log line listing a group should read the way the file does.
+    """
+    groups: dict[tuple[object, ...], list[TriggerConfig]] = {}
+    singles: list[tuple[TriggerConfig, ...]] = []
+    order: list[tuple[object, ...] | int] = []
+    for trigger in triggers:
+        if not trigger.batchable:
+            order.append(len(singles))
+            singles.append((trigger,))
+            continue
+        key = trigger.batch_key
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(trigger)
+    out: list[tuple[TriggerConfig, ...]] = []
+    for item in order:
+        out.append(singles[item] if isinstance(item, int) else tuple(groups[item]))
+    return tuple(out)
+
 
 def _health_config(env: Mapping[str, str]) -> HealthConfig:
     """The camera health check, which is off unless explicitly switched on."""
@@ -817,6 +902,7 @@ def _vision_config(env: Mapping[str, str], health: HealthConfig) -> VisionConfig
         max_explanation_chars=_get_int(
             env, "VISION_MAX_EXPLANATION_CHARS", health.max_explanation_chars
         ),
+        batch=_get_bool(env, "VISION_BATCH_TRIGGERS", True),
     )
 
 

@@ -87,6 +87,8 @@ JOB_BUCKETS: Final[tuple[float, ...]] = (
 JOBS: Final[tuple[str, ...]] = ("poll", "events", "health_sweep", "sheets")
 
 OUTCOME_SUCCESS: Final = "success"
+#: A batched vision reply that was not an answer per trigger.
+OUTCOME_UNREADABLE: Final = "unreadable"
 OUTCOME_ERROR: Final = "error"
 OUTCOME_AUTH_ERROR: Final = "auth_error"
 
@@ -604,6 +606,12 @@ class Metrics:
             "Unix time at which each trigger last checked each camera.",
             ("trigger", "camera"),
         )
+        self.trigger_batches = registry.counter(
+            "trigger_batch_calls_total",
+            "Vision calls that asked several triggers at once, by outcome. "
+            "`unreadable` fell back to asking each trigger separately.",
+            ("outcome",),
+        )
         self.trigger_snapshots = registry.counter(
             "trigger_snapshots_total",
             "Matching frames published, by trigger and camera. Only triggers "
@@ -692,6 +700,12 @@ class Metrics:
             self.configured_seconds.set(
                 reports.refresh_minutes * 60.0, setting="sheets_refresh_interval"
             )
+        for group in config.trigger_groups:
+            if len(group) > 1:
+                # So the series exists before the first sweep, the way JOBS
+                # does: no batched calls yet should read as zero, not absent.
+                for outcome in (OUTCOME_SUCCESS, OUTCOME_UNREADABLE, OUTCOME_ERROR):
+                    self.trigger_batches.inc(0, outcome=outcome)
         for trigger in config.active_triggers:
             # Make each trigger's job series exist before its first sweep, the
             # way JOBS does for the fixed ones: a trigger that has never
@@ -898,6 +912,10 @@ class Metrics:
             self.trigger_state.set(
                 float(state == answer), trigger=trigger, camera=slug, state=state
             )
+
+    def record_trigger_batch(self, outcome: str) -> None:
+        """One call that asked several triggers at once."""
+        self.trigger_batches.inc(outcome=outcome)
 
     def record_trigger_snapshot(self, trigger: str, camera: Camera) -> None:
         """One matching frame went to the broker."""

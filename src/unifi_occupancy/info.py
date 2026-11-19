@@ -117,8 +117,15 @@ def service_info_payload(
                 "interval_minutes": trigger.interval_minutes,
                 "model": trigger.model,
                 "publish_snapshot": trigger.publish_snapshot,
+                "batch": trigger.batch,
             }
             for trigger in config.active_triggers
+        ]
+    if config.active_triggers:
+        # Which triggers share a call, so the request count is explicable from
+        # the info topic rather than only from the metrics.
+        payload["trigger_groups"] = [
+            [trigger.key for trigger in group] for group in config.trigger_groups if len(group) > 1
         ]
     if camera_count is not None:
         payload["cameras"] = camera_count

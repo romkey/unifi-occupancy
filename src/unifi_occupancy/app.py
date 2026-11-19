@@ -282,11 +282,12 @@ async def _serve(
                 config.health.base_url,
             )
         trigger_judges: list[VisionTriggerJudge] = []
-        for trigger in config.active_triggers:
-            trigger_judge = VisionTriggerJudge(trigger)
+        for group in config.trigger_groups:
+            lead = group[0]
+            trigger_judge = VisionTriggerJudge(lead)
             trigger_judges.append(trigger_judge)
             watcher = TriggerWatcher(
-                trigger,
+                group,
                 protect,
                 publisher,
                 trigger_judge,
@@ -299,25 +300,36 @@ async def _serve(
                     name=watcher.job,
                 )
             )
-            logger.info(
-                "watching %s for %r every %g minute(s) with %s at %s",
-                "every camera" if trigger.all_cameras else ", ".join(trigger.cameras),
-                trigger.name,
-                trigger.interval_minutes,
-                trigger.model,
-                trigger.base_url,
-            )
-            if trigger.publish_snapshot:
-                # Said out loud at startup, on purpose: this is the one setting
-                # that puts a picture on the broker, and whoever reads the log
-                # should not have to go and find config.yaml to learn that.
-                logger.warning(
-                    "%r will publish the frame that matched to "
-                    "%s/<camera>/trigger/%s/snapshot (unretained)",
-                    trigger.name,
-                    config.mqtt.topic_prefix,
-                    trigger.key,
+            if len(group) > 1:
+                logger.info(
+                    "asking %s together every %g minute(s) with %s at %s -- "
+                    "one frame and one request covers all %d",
+                    ", ".join(repr(trigger.name) for trigger in group),
+                    lead.interval_minutes,
+                    lead.model,
+                    lead.base_url,
+                    len(group),
                 )
+            for trigger in group:
+                logger.info(
+                    "watching %s for %r every %g minute(s) with %s at %s",
+                    "every camera" if trigger.all_cameras else ", ".join(trigger.cameras),
+                    trigger.name,
+                    trigger.interval_minutes,
+                    trigger.model,
+                    trigger.base_url,
+                )
+                if trigger.publish_snapshot:
+                    # Said out loud at startup, on purpose: this is the one
+                    # setting that puts a picture on the broker, and whoever
+                    # reads the log should not have to go and find config.yaml.
+                    logger.warning(
+                        "%r will publish the frame that matched to "
+                        "%s/<camera>/trigger/%s/snapshot (unretained)",
+                        trigger.name,
+                        config.mqtt.topic_prefix,
+                        trigger.key,
+                    )
         if config.protect.use_websocket:
             tasks.append(asyncio.create_task(service.watch_events_forever(), name="events"))
         if store is not None and config.reports is not None:
