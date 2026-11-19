@@ -1547,3 +1547,88 @@ async def test_a_batched_reply_that_is_prose_returns_none_for_the_fallback() -> 
 
     async with judge_for(handler, FIRE) as judge:
         assert await judge.evaluate_batch(IMAGE, [FIRE, SMOKE]) is None
+
+
+@pytest.mark.parametrize(
+    ("label", "body"),
+    [
+        # A model that ignored the batched format and answered the way a single
+        # trigger is answered. Valid JSON, and not an answer to any question.
+        ("the single-trigger shape", '{"match": true, "explanation": "flames"}'),
+        ("an unrelated object", '{"error": "I cannot see images"}'),
+        ("an empty object", "{}"),
+        ("a refusal wrapped in JSON", '{"detail": "content policy"}'),
+    ],
+)
+def test_json_carrying_none_of_the_ids_asks_for_the_fallback(label: str, body: str) -> None:
+    """Valid JSON is not enough -- it has to answer the questions asked.
+
+    Reading one of these as an answer would mark every trigger on the camera
+    unknown at the same moment, which is the correlated failure the fallback
+    exists to prevent.
+    """
+    assert parse_batch_answer(body, KEYS) is None, label
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '{"answers": {"fire": true, "smoke": false}}',
+        '{"results": {"fire": {"match": true}, "smoke": {"match": false}}}',
+        '{"questions": {"fire": "yes", "smoke": "no"}}',
+    ],
+)
+def test_an_answer_wrapped_in_a_key_of_its_own_is_still_an_answer(body: str) -> None:
+    """Worth tolerating: the alternative is a wasted round trip."""
+    answers = parse_batch_answer(body, KEYS)
+
+    assert answers is not None
+    assert answers["fire"].status == MATCH
+    assert answers["smoke"].status == CLEAR
+
+
+def test_one_id_is_enough_to_read_the_rest_as_missing() -> None:
+    """Once any id came back, the model understood the format."""
+    answers = parse_batch_answer('{"fire": true}', KEYS)
+
+    assert answers is not None
+    assert answers["fire"].status == MATCH
+    assert answers["smoke"].status == UNKNOWN
+
+
+async def test_a_single_shaped_reply_makes_the_judge_ask_for_the_fallback() -> None:
+    """End to end: the judge returns None so the watcher asks separately."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=completion('{"match": false}'))
+
+    async with judge_for(handler, FIRE) as judge:
+        assert await judge.evaluate_batch(IMAGE, [FIRE, SMOKE]) is None
+
+
+async def test_a_single_shaped_reply_does_not_mark_the_whole_group_unknown() -> None:
+    """The bug this guards: valid JSON, no ids, every trigger unknown at once."""
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        prompt = next(
+            part["text"]
+            for part in json.loads(request.content)["messages"][0]["content"]
+            if part["type"] == "text"
+        )
+        calls.append("batch" if "<question id=" in prompt else "single")
+        if calls[-1] == "batch":
+            # Ignores the format and answers as though asked one question.
+            return httpx.Response(200, json=completion('{"match": true, "explanation": "x"}'))
+        return httpx.Response(200, json=completion('{"match": true, "explanation": "flames"}'))
+
+    judge = judge_for(handler, FIRE)
+    sink = FakeSink()
+    watcher = watcher_for(FakeSnapshots(IMAGE), judge, sink, [FIRE, SMOKE])  # type: ignore[arg-type]
+    try:
+        await watcher.sweep([CAMERA])
+    finally:
+        await judge.aclose()
+
+    assert calls == ["batch", "single", "single"]
+    assert [result.status for _, result in sink.published] == [MATCH, MATCH]

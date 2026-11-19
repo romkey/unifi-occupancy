@@ -308,23 +308,49 @@ def parse_batch_answer(
 ) -> dict[str, TriggerAnswer] | None:
     """Read one batched reply into an answer per trigger.
 
-    ``None`` means the reply was not a JSON object at all, which is the
-    caller's signal to fall back to asking each trigger on its own: a reply
-    nobody can read would otherwise take every trigger on that camera down
-    together, and a correlated ``unknown`` across an alarm and its neighbours
-    is a worse failure than the one extra round trip.
+    ``None`` is the caller's signal to fall back to asking each trigger on its
+    own, and means the reply was not an answer *per trigger*: not JSON at all,
+    or JSON carrying none of the ids that were asked about. Being valid JSON is
+    not enough. A model that ignores the batched format and answers in the
+    single-trigger shape -- ``{"match": true, "explanation": "..."}`` -- parses
+    perfectly and says nothing about any of the questions, so treating it as an
+    answer would mark every trigger on the camera ``unknown`` at the same
+    moment. That correlated failure across an alarm and its neighbours is the
+    exact thing the fallback exists to prevent, and it is worse than one extra
+    round trip.
 
-    A reply that *is* an object but is missing a key, or answers one with
-    something unreadable, marks only that trigger :data:`UNKNOWN`. The others
-    keep their answers. Partial credit is the whole point of asking by id.
+    A reply carrying *some* of the ids is read for what it has: a missing id,
+    or one answered with something unreadable, marks only that trigger
+    :data:`UNKNOWN` and the rest keep their answers. Partial credit is the
+    whole point of asking by id, and once any id came back the model plainly
+    understood the format.
     """
     body = json_object(text)
     if body is None:
+        return None
+    body = _unwrap(body, keys)
+    if not any(key in body for key in keys):
         return None
     answers: dict[str, TriggerAnswer] = {}
     for key in keys:
         answers[key] = _one_of_batch(body, key, limit)
     return answers
+
+
+def _unwrap(body: dict[str, Any], keys: Sequence[str]) -> dict[str, Any]:
+    """Descend one level into ``{"answers": {...}}`` and its cousins.
+
+    Models like to wrap a result set in a key of their own choosing -- a
+    habit worth tolerating, since the alternative is a fallback round trip for
+    a reply that did answer every question. One level only, and only when the
+    outer object holds none of the ids itself.
+    """
+    if any(key in body for key in keys):
+        return body
+    for value in body.values():
+        if isinstance(value, dict) and any(key in value for key in keys):
+            return value
+    return body
 
 
 def _one_of_batch(body: dict[str, Any], key: str, limit: int) -> TriggerAnswer:

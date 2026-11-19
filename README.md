@@ -449,8 +449,10 @@ has taken over the answer format a batched call needs.
 unreadable, marks that one trigger `unknown` and leaves the rest alone. A reply that is not
 an answer at all falls back to asking each trigger separately, on the same frame — one extra
 round trip only when something is already wrong, rather than every trigger on that camera
-going `unknown` at the same instant. Only the endpoint actually failing is shared, which
-separate calls would not have survived either.
+going `unknown` at the same instant. That includes a reply which is perfectly good JSON but
+answers none of the questions, which is what a model does when it ignores the batched format
+and replies as though it had been asked one thing. Only the endpoint actually failing is
+shared, which separate calls would not have survived either.
 
 `unifi-occupancy/info` lists `trigger_groups`, and
 `trigger_batch_calls_total{outcome}` counts batched calls and the fallbacks, so you can see
