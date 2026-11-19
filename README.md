@@ -373,6 +373,41 @@ automation:
 The camera entity has no image until the first match, since its topic is unretained — Home
 Assistant shows it as unknown until then, which is correct rather than a fault.
 
+#### A blueprint, if you would rather not write that YAML
+
+[`blueprints/automation/unifi_occupancy/trigger_notify.yaml`](blueprints/automation/unifi_occupancy/trigger_notify.yaml)
+does the above from the UI: pick the triggers you care about, pick how you want to be told,
+and it works out the rest. Copy it into `<config>/blueprints/automation/unifi_occupancy/`
+and reload automations, or import it by URL from **Settings → Automations & Scenes →
+Blueprints → Import**.
+
+It derives each trigger's status sensor and snapshot camera from the sensor that fired, so
+you select one set of entities rather than pairing three up by hand. It then exposes
+`trigger_name`, `camera_name`, `explanation`, `model`, `checked_at`, `snapshot_entity`,
+`image_url` and a ready-made `title`/`message` to whatever action you chose — so the
+notification above is three fields in a form:
+
+```yaml
+action: notify.mobile_app_your_phone
+data:
+  title: "{{ title }}"
+  message: "{{ message }}"
+  data:
+    image: "{{ image_url }}"
+```
+
+Two options worth knowing. *Only when the model actually answered* adds the `match` check
+from the previous section, so a stale `ON` left over from before an outage cannot notify you
+again; it is on by default. *Quiet period* suppresses repeat matches for a while — rarely
+needed, since a trigger only fires on the way from `OFF` to `ON`, but useful for something
+flickering in and out of frame.
+
+The derivation reads the entity ids as announced over discovery
+(`binary_sensor.unifi_occupancy_front_door_trigger_fire` and its `_status` and `_snapshot`
+companions). Rename those companions in Home Assistant and the blueprint stops finding
+them, at which point it degrades — no picture, no `match` check — rather than failing. The
+boolean you selected is unaffected either way.
+
 ### What it costs
 
 One image per watched camera per interval. A fire check on four doorways every five minutes
@@ -787,6 +822,7 @@ mosquitto_sub -h localhost -t 'unifi-occupancy/#' -v
 | `report.py` | Grouping, the timeline arithmetic, the refresh schedule |
 | `render.py` | View models → self-contained HTML |
 | `app.py` | The poll, event and sheet loops |
+| `blueprints/` | Home Assistant blueprints, shipped for copying into your config |
 
 The Protect and MQTT transports sit behind thin seams, so the test suite runs with no
 controller and no broker.
