@@ -275,6 +275,7 @@ Each trigger takes:
 | `stagger_seconds` | `5` | Gap between one camera's check and the next |
 | `max_explanation_chars` | `200` | Trim length for the explanation |
 | `append_answer_format` | `true` | Append the JSON answer format to your prompt |
+| `batch` | `true` | Let this trigger share one call with others like it — see below |
 
 The endpoint, key and model default to whatever the camera health check uses, so a local
 vision server configured once serves both; `VISION_API_BASE_URL`, `VISION_API_KEY` and
@@ -410,13 +411,60 @@ companions). Rename those companions in Home Assistant and the blueprint stops f
 them, at which point it degrades — no picture, no `match` check — rather than failing. The
 boolean you selected is unaffected either way.
 
+### Triggers on the same interval share a call
+
+Triggers agreeing on the things a single request fixes — the **interval**, the endpoint, the
+API key, the model and `high_quality_snapshot` — are asked together about one frame. Three
+such triggers on a camera make one snapshot and one request per cycle, not three. Nothing to
+configure; it is what happens unless you say otherwise.
+
+The saving is larger than the request count suggests. A vision request is almost entirely
+the image, so sending one frame with three questions costs close to what one question costs,
+rather than three times as much. It also spares your controller two snapshots per camera per
+cycle.
+
+This is also why a group runs as one scheduled job. Before, each trigger had its own loop
+sleeping `interval - elapsed`, so two triggers nominally on five minutes started a moment
+apart and drifted as the model's latency varied — there was no moment at which they wanted
+the same frame. Sharing a cycle removes the question rather than answering it.
+
+**What it costs in accuracy.** A combined prompt is not free. A model answering four
+questions at once is not the same model answering one, and smaller local models feel this
+more than hosted ones. Four specific failures, and what the prompt does about each:
+
+| | |
+| --- | --- |
+| **Bleed** — your fire prompt's "do not answer yes for sunsets" leaking onto the parcel question | Each prompt goes inside its own `<question id="...">` block, and the preamble says instructions inside a question govern that question alone |
+| **Priming** — asking about fire and smoke together making both likelier | The preamble says what one question asks about is not evidence for any other |
+| **Narrative** — the model making the answers cohere into one story about the frame | The preamble says not to reconcile them; all can be true, all can be false |
+| **Contagious guessing** — one unanswerable question dragging the rest down | The preamble asks for an explicit `null` on anything the frame cannot settle, per question |
+
+Your prompts go in verbatim — nothing rewrites them. A trigger whose wording you have tuned
+carefully, and which you would rather have the model's whole attention, gets `batch: false`
+and is asked on its own exactly as before. `VISION_BATCH_TRIGGERS=false` does that for every
+trigger at once. A trigger setting `append_answer_format: false` is never batched, since it
+has taken over the answer format a batched call needs.
+
+**Nothing fails together.** A key missing from the reply, or answered with something
+unreadable, marks that one trigger `unknown` and leaves the rest alone. A reply that is not
+an answer at all falls back to asking each trigger separately, on the same frame — one extra
+round trip only when something is already wrong, rather than every trigger on that camera
+going `unknown` at the same instant. Only the endpoint actually failing is shared, which
+separate calls would not have survived either.
+
+`unifi-occupancy/info` lists `trigger_groups`, and
+`trigger_batch_calls_total{outcome}` counts batched calls and the fallbacks, so you can see
+what is actually being combined.
+
 ### What it costs
 
-One image per watched camera per interval. A fire check on four doorways every five minutes
-is about 1,150 images a day — pennies on a small hosted model, free on your own hardware,
-and the reason the default interval is fifteen minutes rather than one. Pick the interval
-for how fast the thing you are watching for matters, keep the camera list short, and prefer
-a local model if you intend to run it at minutes.
+One image per watched camera per interval, per *group* of triggers rather than per trigger.
+A fire check on four doorways every five minutes is about 1,150 images a day — pennies on a
+small hosted model, free on your own hardware, and the reason the default interval is
+fifteen minutes rather than one. Add a second trigger on the same interval and those four
+doorways still cost 1,150; give it a different interval and you have two sweeps. Pick the
+interval for how fast the thing you are watching for matters, keep the camera list short,
+and prefer a local model if you intend to run it at minutes.
 
 The same trade as the health check applies: with a trigger configured, snapshots leave this
 process for the endpoint you named. They are held in memory for one request and are never
@@ -634,6 +682,7 @@ prefixed `unifi_occupancy_`; the table leaves that off to stay readable.
 | `job_runs_total{job,outcome}`, `job_duration_seconds{job}`, `job_in_progress{job}`, `job_last_success_timestamp_seconds{job}` | The background jobs — `poll`, `events`, `health_sweep`, `sheets` and one `trigger:<name>` per custom trigger — their outcomes, durations and last success |
 | `health_checks_total{camera,verdict}`, `health_check_duration_seconds`, `camera_health{camera,status}`, `health_last_check_timestamp_seconds{camera}` | The optional vision check: verdicts per camera, how long each took, when each was last looked at |
 | `trigger_checks_total{trigger,camera,answer}`, `trigger_check_duration_seconds{trigger}`, `trigger_state{trigger,camera,state}`, `trigger_last_check_timestamp_seconds{trigger,camera}` | Custom triggers: answers per trigger and camera, how long each check took, when each was last asked |
+| `trigger_batch_calls_total{outcome}` | Calls that asked several triggers at once. `unreadable` is one that fell back to separate calls |
 | `trigger_snapshots_total{trigger,camera}` | Matching frames published to the broker. Stays absent unless a trigger has `publish_snapshot` on |
 | `recorded_edges_total{kind,edge}`, `recorder_failures_total{operation}`, `sheets_written_total` | The history database and the daily sheets |
 | `http_requests_total{path,status}`, `http_request_duration_seconds` | This endpoint itself |
@@ -769,6 +818,7 @@ groups and the daily sheets are YAML; see [above](#configuration).
 | `VISION_STAGGER_SECONDS` | `CAMERA_HEALTH_STAGGER_SECONDS` | Default gap within a trigger sweep |
 | `VISION_HIGH_QUALITY_SNAPSHOT` | `CAMERA_HEALTH_HIGH_QUALITY_SNAPSHOT` | Default snapshot quality |
 | `VISION_MAX_EXPLANATION_CHARS` | `CAMERA_HEALTH_MAX_EXPLANATION_CHARS` | Default explanation trim |
+| `VISION_BATCH_TRIGGERS` | `true` | `false` asks every trigger on its own, never combined |
 | `METRICS_ENABLED` | `false` | Serve the Prometheus endpoint |
 | `METRICS_TOKEN` | unset | *Required* when the endpoint is on; at least 16 characters |
 | `METRICS_HOST` | `0.0.0.0` | Address to bind |

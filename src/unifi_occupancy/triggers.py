@@ -43,7 +43,13 @@ from typing import Any, Protocol
 import httpx
 
 from .config import TriggerConfig
-from .metrics import OUTCOME_ERROR, OUTCOME_SUCCESS, Metrics, default_metrics
+from .metrics import (
+    OUTCOME_ERROR,
+    OUTCOME_SUCCESS,
+    OUTCOME_UNREADABLE,
+    Metrics,
+    default_metrics,
+)
 from .models import Camera
 from .vision import (
     VisionClient,
@@ -212,6 +218,151 @@ def parse_answer(text: str, *, limit: int = 200) -> tuple[str, str | None]:
     return UNKNOWN, tidy(f"could not read the model's reply: {text}", limit)
 
 
+# --------------------------------------------------------------------------- #
+# Asking several triggers at once
+# --------------------------------------------------------------------------- #
+
+#: What goes in front of the operator's questions in a batched prompt.
+#:
+#: A vision request is mostly the image, so asking four triggers in one call
+#: costs about what asking one costs. The saving is free; the accuracy is not.
+#: Every line below is aimed at one specific way a combined prompt answers
+#: worse than four separate ones:
+#:
+#: * **Bleed.** Each prompt was written and tuned on its own, exclusions and
+#:   all -- "do not answer yes for sunsets, headlights, a lit cigarette". Those
+#:   belong to the question that carries them. Said loose in one prompt they
+#:   would apply to everything.
+#: * **Priming.** A model asked about fire and about a parcel in one breath is
+#:   readier to see both. Naming a thing is not evidence of it.
+#: * **Narrative.** Asked several questions together, a model wants the answers
+#:   to cohere -- to tell one story about the frame. These are unrelated
+#:   questions and need not agree.
+#: * **Contagious guessing.** One question it cannot answer should not drag the
+#:   others down with it, and a guess is worse than an admission.
+#:
+#: None of this makes a batched answer as good as four separate ones. It is
+#: meant to narrow the gap enough that the saving is worth having, which is why
+#: a trigger can always opt out with ``batch: false``.
+BATCH_PREAMBLE = """\
+You are shown one still frame from a fixed security camera, and several
+separate questions about it. The questions were written by different people,
+for different reasons, and have nothing to do with one another.
+
+Answer each question as though it were the only question you had been asked.
+
+- Answer each question entirely on its own. What one question asks about is
+  not a hint, a clue or evidence for any other question.
+- Instructions, exclusions and definitions inside a question govern that
+  question alone. They never carry over to another question.
+- Do not reconcile your answers with each other. All of them can be true, all
+  of them can be false, and they do not have to add up to one story about the
+  frame.
+- Answer only from what is visible in this frame. Do not infer what probably
+  happened, what is out of shot, or what came before.
+- If a question cannot be answered from this frame, say so for that question
+  rather than guessing. An unanswered question is more use than a guessed one,
+  and says nothing about the others."""
+
+#: How a batched answer must come back: one entry per question id.
+BATCH_ANSWER_FORMAT = """\
+Reply with one JSON object and nothing else, with one entry per question id,
+using the ids exactly as they appear above:
+
+{"<id>": {"match": true, "explanation": "<at most 15 words>"}}
+
+- "match": true if you can see what that question describes, false if you have
+  looked and cannot see it, null if this frame cannot answer that question.
+- "explanation": a few words saying what you saw, for a true answer. Leave it
+  out otherwise.
+- Include an entry for every id listed. Do not add ids that were not listed."""
+
+#: Opening and closing tags of one question inside a batched prompt.
+_OPEN = '<question id="{key}">'
+_CLOSE = "</question>"
+
+
+def silo(prompt: str) -> str:
+    """One trigger's prompt, made safe to drop inside a tagged block.
+
+    A prompt is operator-written text going into a structure the model is told
+    to trust, so it must not be able to close its own block and write
+    instructions at the level above -- whether on purpose or by writing about
+    HTML. Cheap to prevent, so prevented.
+    """
+    cleaned = prompt.replace("<question", "(question").replace("</question>", "(/question)")
+    return cleaned.strip()
+
+
+def batch_question(triggers: Sequence[TriggerConfig]) -> str:
+    """The one prompt that asks every trigger in a group at once."""
+    parts = [BATCH_PREAMBLE, "", "Here are the questions.", ""]
+    for trigger in triggers:
+        parts += [_OPEN.format(key=trigger.key), silo(trigger.prompt), _CLOSE, ""]
+    parts.append(BATCH_ANSWER_FORMAT)
+    return "\n".join(parts)
+
+
+def parse_batch_answer(
+    text: str, keys: Sequence[str], *, limit: int = 200
+) -> dict[str, TriggerAnswer] | None:
+    """Read one batched reply into an answer per trigger.
+
+    ``None`` means the reply was not a JSON object at all, which is the
+    caller's signal to fall back to asking each trigger on its own: a reply
+    nobody can read would otherwise take every trigger on that camera down
+    together, and a correlated ``unknown`` across an alarm and its neighbours
+    is a worse failure than the one extra round trip.
+
+    A reply that *is* an object but is missing a key, or answers one with
+    something unreadable, marks only that trigger :data:`UNKNOWN`. The others
+    keep their answers. Partial credit is the whole point of asking by id.
+    """
+    body = json_object(text)
+    if body is None:
+        return None
+    answers: dict[str, TriggerAnswer] = {}
+    for key in keys:
+        answers[key] = _one_of_batch(body, key, limit)
+    return answers
+
+
+def _one_of_batch(body: dict[str, Any], key: str, limit: int) -> TriggerAnswer:
+    """One trigger's entry out of a batched reply."""
+    if key not in body:
+        return TriggerAnswer(UNKNOWN, f"the model left {key!r} out of its answer")
+    value = body[key]
+    # An explicit null is the model saying it could not tell, which is what the
+    # prompt asked it to do rather than guess.
+    if value is None:
+        return TriggerAnswer(UNKNOWN, "the model could not tell from this frame")
+    if isinstance(value, dict):
+        said = next((value[k] for k in _EXPLANATION_KEYS if value.get(k)), None)
+        explanation = tidy(said, limit)
+        for answer_key in _ANSWER_KEYS:
+            if answer_key in value:
+                if value[answer_key] is None:
+                    return TriggerAnswer(UNKNOWN, "the model could not tell from this frame")
+                decided = _boolean(value[answer_key])
+                if decided is None:
+                    return TriggerAnswer(
+                        UNKNOWN, tidy(f"unrecognised answer {value[answer_key]!r}", limit)
+                    )
+                if decided:
+                    return TriggerAnswer(
+                        MATCH, explanation or "the model reported a match without saying what"
+                    )
+                return TriggerAnswer(CLEAR, explanation)
+        return TriggerAnswer(UNKNOWN, tidy(f"could not read the answer for {key!r}", limit))
+    # A bare value: {"fire": true} or {"fire": "no"}, both of which happen.
+    decided = _boolean(value)
+    if decided is None:
+        return TriggerAnswer(UNKNOWN, tidy(f"unrecognised answer {value!r}", limit))
+    if decided:
+        return TriggerAnswer(MATCH, "the model reported a match without saying what")
+    return TriggerAnswer(CLEAR, None)
+
+
 def endpoint_for(config: TriggerConfig) -> VisionEndpoint:
     """The vision endpoint this trigger asks its question of."""
     return VisionEndpoint(
@@ -223,9 +374,23 @@ def endpoint_for(config: TriggerConfig) -> VisionEndpoint:
 
 
 class Judge(Protocol):
-    """Anything that can look at a frame and answer one trigger's question."""
+    """Anything that can look at a frame and answer triggers' questions."""
 
-    async def evaluate(self, image: bytes, *, content_type: str = ...) -> TriggerAnswer: ...
+    async def evaluate(
+        self,
+        image: bytes,
+        *,
+        content_type: str = ...,
+        trigger: TriggerConfig | None = ...,
+    ) -> TriggerAnswer: ...
+
+    async def evaluate_batch(
+        self,
+        image: bytes,
+        triggers: Sequence[TriggerConfig],
+        *,
+        content_type: str = ...,
+    ) -> dict[str, TriggerAnswer] | None: ...
 
 
 class VisionTriggerJudge:
@@ -249,18 +414,69 @@ class VisionTriggerJudge:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def evaluate(self, image: bytes, *, content_type: str = "image/jpeg") -> TriggerAnswer:
+    async def evaluate(
+        self,
+        image: bytes,
+        *,
+        content_type: str = "image/jpeg",
+        trigger: TriggerConfig | None = None,
+    ) -> TriggerAnswer:
+        """Ask one trigger's question on its own.
+
+        ``trigger`` names which one, for a judge serving a group; left out, it
+        is the trigger the judge was built for. Every trigger in a group shares
+        an endpoint, a key and a model by construction, so one client serves
+        them all.
+        """
+        asked = trigger or self._config
         try:
-            reply = await self._client.ask(self._config.question, image, content_type=content_type)
+            reply = await self._client.ask(asked.question, image, content_type=content_type)
         except VisionError as exc:
             raise TriggerError(str(exc)) from exc
 
-        status, explanation = parse_answer(reply.text, limit=self._config.max_explanation_chars)
+        status, explanation = parse_answer(reply.text, limit=asked.max_explanation_chars)
         return TriggerAnswer(
             status=status,
             explanation=explanation,
-            model=reply.model or self._config.model,
+            model=reply.model or asked.model,
         )
+
+    async def evaluate_batch(
+        self,
+        image: bytes,
+        triggers: Sequence[TriggerConfig],
+        *,
+        content_type: str = "image/jpeg",
+    ) -> dict[str, TriggerAnswer] | None:
+        """Ask every trigger in ``triggers`` about one frame, in one call.
+
+        ``None`` when the reply could not be read as an answer per trigger, so
+        the caller can ask them separately instead. A :class:`TriggerError`
+        still means the endpoint itself failed, which separate calls would not
+        fix.
+        """
+        question = batch_question(triggers)
+        try:
+            reply = await self._client.ask(question, image, content_type=content_type)
+        except VisionError as exc:
+            raise TriggerError(str(exc)) from exc
+
+        keys = [trigger.key for trigger in triggers]
+        limit = max(trigger.max_explanation_chars for trigger in triggers)
+        answers = parse_batch_answer(reply.text, keys, limit=limit)
+        if answers is None:
+            return None
+        model = reply.model or self._config.model
+        # Each trigger's own explanation limit, now that the answers are apart.
+        limits = {trigger.key: trigger.max_explanation_chars for trigger in triggers}
+        return {
+            key: TriggerAnswer(
+                status=answer.status,
+                explanation=tidy(answer.explanation, limits[key]),
+                model=model,
+            )
+            for key, answer in answers.items()
+        }
 
 
 class Snapshots(Protocol):
@@ -278,11 +494,25 @@ class TriggerSink(Protocol):
 
 
 class TriggerWatcher:
-    """Puts one trigger's question to its cameras on a schedule."""
+    """Puts a group of triggers' questions to their cameras on a schedule.
+
+    One watcher, one schedule, one snapshot per camera per cycle. A group is
+    the triggers that agreed on :attr:`TriggerConfig.batch_key` -- so they want
+    the same interval, endpoint, model and snapshot quality -- and a lone
+    trigger is simply a group of one, run exactly as it was before groups
+    existed.
+
+    Running a group from one task is what makes a shared call possible at all.
+    Before, each trigger had its own loop sleeping ``interval - elapsed``, so
+    two triggers nominally on the same interval started a moment apart and
+    drifted as the model's latency varied; there was no instant at which they
+    could be said to want the same frame. Now they share a cycle by
+    construction, and there is nothing to align.
+    """
 
     def __init__(
         self,
-        config: TriggerConfig,
+        config: TriggerConfig | Sequence[TriggerConfig],
         snapshots: Snapshots,
         sink: TriggerSink,
         judge: Judge,
@@ -292,7 +522,13 @@ class TriggerWatcher:
         is_current: Callable[[str], bool] | None = None,
         metrics: Metrics | None = None,
     ) -> None:
-        self._config = config
+        triggers = (config,) if isinstance(config, TriggerConfig) else tuple(config)
+        if not triggers:
+            raise ValueError("a TriggerWatcher needs at least one trigger")
+        self._triggers = triggers
+        # The group agrees on everything the schedule and the request need, so
+        # the first member speaks for all of them on those.
+        self._config = triggers[0]
         self._snapshots = snapshots
         self._sink = sink
         self._judge = judge
@@ -303,15 +539,47 @@ class TriggerWatcher:
 
     @property
     def config(self) -> TriggerConfig:
+        """The member that speaks for the group's schedule and endpoint."""
         return self._config
 
     @property
+    def triggers(self) -> tuple[TriggerConfig, ...]:
+        return self._triggers
+
+    @property
+    def batched(self) -> bool:
+        return len(self._triggers) > 1
+
+    @property
+    def jobs(self) -> tuple[str, ...]:
+        """Each member's name in the job metrics.
+
+        Per trigger rather than per group: a group shares one call, but
+        ``trigger:fire`` is what someone graphing a fire check looks for, and
+        it should not vanish because a second trigger joined its interval. All
+        members therefore report the same duration, which is the truth -- the
+        call took that long for each of them.
+        """
+        return tuple(f"trigger:{trigger.key}" for trigger in self._triggers)
+
+    @property
     def job(self) -> str:
-        """This trigger's name in the job metrics."""
-        return f"trigger:{self._config.key}"
+        """A name for the asyncio task. Not a metric label."""
+        return "trigger:" + "+".join(trigger.key for trigger in self._triggers)
 
     def selects(self, camera: Camera) -> bool:
-        return self._config.selects(camera.id, camera.name)
+        return any(self.triggers_for(camera))
+
+    def triggers_for(self, camera: Camera) -> tuple[TriggerConfig, ...]:
+        """The members of this group that watch ``camera``.
+
+        Members need not agree on their camera lists, so a group of three can
+        be three questions at the front door and one at the gate. Whatever this
+        returns for a camera is what that camera's call asks about.
+        """
+        return tuple(
+            trigger for trigger in self._triggers if trigger.selects(camera.id, camera.name)
+        )
 
     def cameras_for(self, cameras: Sequence[Camera]) -> list[Camera]:
         return [camera for camera in cameras if self.selects(camera)]
@@ -327,87 +595,149 @@ class TriggerWatcher:
         """
         return self._is_current is None or self._is_current(camera.id)
 
-    def _result(self, status: str, explanation: str | None, model: str | None) -> TriggerResult:
+    def _result(
+        self,
+        trigger: TriggerConfig,
+        status: str,
+        explanation: str | None,
+        model: str | None,
+    ) -> TriggerResult:
         return TriggerResult(
-            trigger=self._config.key,
-            name=self._config.name,
+            trigger=trigger.key,
+            name=trigger.name,
             status=status,
             explanation=explanation,
             model=model,
             checked_at=datetime.now(UTC),
         )
 
+    def _all(
+        self, triggers: Sequence[TriggerConfig], status: str, explanation: str | None
+    ) -> list[tuple[TriggerResult, bytes | None]]:
+        """The same answer for every trigger: no frame, so nothing to ask."""
+        return [(self._result(trigger, status, explanation, None), None) for trigger in triggers]
+
     async def check(self, camera: Camera) -> TriggerResult:
-        """One camera: snapshot, ask, answer, and how long all that took."""
-        result, _ = await self.check_frame(camera)
-        return result
+        """One camera, for a watcher holding a single trigger."""
+        checked = await self.check_camera(camera)
+        return checked[0][0]
 
-    async def check_frame(self, camera: Camera) -> tuple[TriggerResult, bytes | None]:
-        """:meth:`check`, plus the frame -- but only if it is to be published.
+    async def check_camera(self, camera: Camera) -> list[tuple[TriggerResult, bytes | None]]:
+        """One camera: snapshot, ask, answer, per trigger watching it.
 
-        The frame comes back only when this trigger has ``publish_snapshot``
-        on *and* the answer was a match. Every other path returns ``None``, so
-        a trigger that was never asked to publish an image cannot accidentally
-        hand one to a caller: the bytes go out of scope when this returns.
+        Each pair's frame is present only where that trigger has
+        ``publish_snapshot`` on *and* its answer was a match, so a trigger
+        never asked to publish an image cannot be handed one. The bytes go out
+        of scope when the caller is done with them.
         """
         started = self._clock()
-        result, image = await self._check(camera)
-        self._metrics.record_trigger_check(
-            self._config.key, camera, result.status, max(0.0, self._clock() - started)
-        )
-        if image is not None and self._config.publish_snapshot and result.matched:
-            return result, image
-        return result, None
+        checked = await self._check(camera)
+        taken = max(0.0, self._clock() - started)
+        out: list[tuple[TriggerResult, bytes | None]] = []
+        for result, image in checked:
+            trigger = self._by_key(result.trigger)
+            self._metrics.record_trigger_check(result.trigger, camera, result.status, taken)
+            keep = image if (image and trigger.publish_snapshot and result.matched) else None
+            out.append((result, keep))
+        return out
 
-    async def _check(self, camera: Camera) -> tuple[TriggerResult, bytes | None]:
+    def _by_key(self, key: str) -> TriggerConfig:
+        return next(trigger for trigger in self._triggers if trigger.key == key)
+
+    async def _check(self, camera: Camera) -> list[tuple[TriggerResult, bytes | None]]:
         """One camera: snapshot, ask, answer. Never raises."""
+        asking = self.triggers_for(camera)
         if not camera.connected:
-            return self._result(UNKNOWN, "camera is not connected", None), None
+            return self._all(asking, UNKNOWN, "camera is not connected")
         try:
             image = await self._snapshots.get_snapshot(
                 camera.id, high_quality=self._config.high_quality_snapshot
             )
         except Exception as exc:  # noqa: BLE001 - a bad snapshot is an answer, not a crash
             logger.warning("no snapshot for %s: %s", camera.name, exc)
-            return self._result(UNKNOWN, tidy(f"could not take a snapshot: {exc}", 200), None), None
+            return self._all(asking, UNKNOWN, tidy(f"could not take a snapshot: {exc}", 200))
         if not image:
-            return self._result(UNKNOWN, "the controller returned no snapshot", None), None
+            return self._all(asking, UNKNOWN, "the controller returned no snapshot")
 
-        try:
-            answer = await self._judge.evaluate(image)
-        except Exception as exc:  # noqa: BLE001 - likewise for the model
-            logger.warning("trigger %s on %s failed: %s", self._config.name, camera.name, exc)
-            return (
-                self._result(UNKNOWN, tidy(str(exc), self._config.max_explanation_chars), None),
-                None,
+        answers = await self._ask(camera, asking, image)
+        results: list[tuple[TriggerResult, bytes | None]] = []
+        for trigger in asking:
+            answer = answers[trigger.key]
+            self._log(trigger, camera, answer)
+            results.append(
+                (self._result(trigger, answer.status, answer.explanation, answer.model), image)
             )
+        return results
 
+    async def _ask(
+        self, camera: Camera, asking: Sequence[TriggerConfig], image: bytes
+    ) -> dict[str, TriggerAnswer]:
+        """Put the questions to the model, together where that is possible.
+
+        One trigger is asked on its own, as it always was: a batched prompt
+        would be pure overhead and a little worse at it. Several are asked in
+        one call, and a reply that cannot be read per trigger falls back to
+        asking each separately -- an unreadable batched answer would otherwise
+        mark every trigger on this camera unknown at the same moment, which on
+        an alarm is a worse failure than one more round trip.
+        """
+        if len(asking) == 1:
+            return {asking[0].key: await self._ask_one(camera, asking[0], image)}
+        try:
+            answers = await self._judge.evaluate_batch(image, asking)
+        except Exception as exc:  # noqa: BLE001 - the endpoint failed, not the reply
+            logger.warning("batched check on %s failed: %s", camera.name, exc)
+            self._metrics.record_trigger_batch(OUTCOME_ERROR)
+            return {
+                trigger.key: TriggerAnswer(UNKNOWN, tidy(str(exc), trigger.max_explanation_chars))
+                for trigger in asking
+            }
+        if answers is not None:
+            self._metrics.record_trigger_batch(OUTCOME_SUCCESS)
+            return answers
+        self._metrics.record_trigger_batch(OUTCOME_UNREADABLE)
+        logger.warning(
+            "could not read a batched answer for %s; asking %d trigger(s) separately",
+            camera.name,
+            len(asking),
+        )
+        return {trigger.key: await self._ask_one(camera, trigger, image) for trigger in asking}
+
+    async def _ask_one(self, camera: Camera, trigger: TriggerConfig, image: bytes) -> TriggerAnswer:
+        """One trigger, one call. Never raises."""
+        try:
+            return await self._judge.evaluate(image, trigger=trigger)
+        except Exception as exc:  # noqa: BLE001 - a model failure is an answer
+            logger.warning("trigger %s on %s failed: %s", trigger.name, camera.name, exc)
+            return TriggerAnswer(UNKNOWN, tidy(str(exc), trigger.max_explanation_chars))
+
+    def _log(self, trigger: TriggerConfig, camera: Camera, answer: TriggerAnswer) -> None:
         if answer.status == MATCH:
             logger.warning(
                 "%s matched on %s: %s",
-                self._config.name,
+                trigger.name,
                 camera.name,
                 answer.explanation or "(no explanation)",
             )
         else:
-            logger.info("%s on %s: %s", self._config.name, camera.name, answer.status)
-        return self._result(answer.status, answer.explanation, answer.model), image
+            logger.info("%s on %s: %s", trigger.name, camera.name, answer.status)
 
     async def sweep(self, cameras: Sequence[Camera]) -> list[TriggerResult]:
-        """Ask about every camera this trigger watches, trickled not burst."""
+        """Ask about every camera this group watches, trickled not burst."""
         results: list[TriggerResult] = []
         for index, camera in enumerate(self.cameras_for(cameras)):
             if index and self._config.stagger_seconds > 0:
                 await self._sleep(self._config.stagger_seconds)
             if not self._still_there(camera):
-                logger.debug("%s went away before its %s check", camera.name, self._config.name)
+                logger.debug("%s went away before its %s check", camera.name, self.job)
                 continue
-            result, image = await self.check_frame(camera)
+            checked = await self.check_camera(camera)
             if not self._still_there(camera):
-                logger.debug("%s went away during its %s check", camera.name, self._config.name)
+                logger.debug("%s went away during its %s check", camera.name, self.job)
                 continue
-            results.append(result)
-            await self._sink.publish_trigger(camera, result, image)
+            for result, image in checked:
+                results.append(result)
+                await self._sink.publish_trigger(camera, result, image)
         return results
 
     async def run_forever(self, cameras: Callable[[], Sequence[Camera]]) -> None:
@@ -419,15 +749,20 @@ class TriggerWatcher:
                 await self._sleep(min(5.0, self._config.interval_seconds))
                 continue
             started = self._clock()
-            self._metrics.start_job(self.job)
+            for job in self.jobs:
+                self._metrics.start_job(job)
             try:
                 await self.sweep(batch)
             except asyncio.CancelledError:
-                self._metrics.job_in_progress.set(0, job=self.job)
+                for job in self.jobs:
+                    self._metrics.job_in_progress.set(0, job=job)
                 raise
             except Exception:
-                self._metrics.finish_job(self.job, OUTCOME_ERROR, max(0.0, self._clock() - started))
+                taken = max(0.0, self._clock() - started)
+                for job in self.jobs:
+                    self._metrics.finish_job(job, OUTCOME_ERROR, taken)
                 raise
             elapsed = self._clock() - started
-            self._metrics.finish_job(self.job, OUTCOME_SUCCESS, max(0.0, elapsed))
+            for job in self.jobs:
+                self._metrics.finish_job(job, OUTCOME_SUCCESS, max(0.0, elapsed))
             await self._sleep(max(1.0, self._config.interval_seconds - elapsed))
