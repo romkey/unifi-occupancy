@@ -18,6 +18,7 @@ from .config import (
     ReportConfig,
     load_config,
     load_file_config,
+    load_vision_config,
 )
 from .report import SheetWriter
 from .store import EventStore
@@ -56,8 +57,12 @@ def rebuild_sheets() -> int:
     try:
         # The whole file, not just ``reports:``: the triggers are what name
         # their own lanes on the sheets, so a rebuild that skipped them would
-        # label every trigger lane out of its slug.
-        from_file = load_file_config(path)
+        # label every trigger lane out of its slug. With the environment's
+        # vision defaults, too, since `record` decides whether a trigger is
+        # drawn a lane at all -- and `VISION_RECORD_TRIGGERS=false` would
+        # otherwise be read here as the default `true` and draw empty lanes on
+        # days nothing was ever written to.
+        from_file = load_file_config(path, vision=load_vision_config())
     except ConfigError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
         return 2

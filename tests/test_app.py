@@ -11,9 +11,9 @@ import pytest
 
 from conftest import FakeTransport, camera_payload
 from unifi_occupancy.app import OccupancyService, _open_store
-from unifi_occupancy.config import Config, ReportConfig
+from unifi_occupancy.config import Config, ReportConfig, TriggerConfig
 from unifi_occupancy.metrics import Metrics
-from unifi_occupancy.models import MOTION, PERSON, DetectionEvent, parse_cameras
+from unifi_occupancy.models import MOTION, PERSON, DetectionEvent, parse_cameras, trigger_kind
 from unifi_occupancy.protect import ProtectError
 from unifi_occupancy.publisher import StatePublisher
 from unifi_occupancy.recorder import EventRecorder
@@ -241,6 +241,31 @@ def test_a_configured_run_opens_the_store_and_tidies_up_after_a_crash(
             datetime.now(tz=UTC) - timedelta(hours=1), datetime.now(tz=UTC) + timedelta(hours=1)
         )
         assert event.ended_at is not None
+    finally:
+        store.close()
+
+
+def test_a_trigger_left_open_by_a_crash_is_cut_at_its_interval(
+    config: Config, tmp_path: Path
+) -> None:
+    """Closed with the detection hold, an hour-long match would read as 30s."""
+    database = tmp_path / "history.sqlite3"
+    started = datetime.now(tz=UTC) - timedelta(hours=3)
+    with EventStore(database) as previous:
+        previous.start_event("cam-1", "Front Door", trigger_kind("fire_or_smoke"), started)
+
+    store = _open_store(
+        replace(
+            config,
+            reports=ReportConfig(database=database),
+            triggers=(TriggerConfig(name="Fire or smoke", prompt="?", interval_minutes=15.0),),
+        )
+    )
+
+    assert store is not None
+    try:
+        (event,) = store.events_between(started - timedelta(hours=1), datetime.now(tz=UTC))
+        assert event.ended_at == started + timedelta(minutes=15)
     finally:
         store.close()
 

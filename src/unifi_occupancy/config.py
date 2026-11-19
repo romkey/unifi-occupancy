@@ -795,6 +795,17 @@ def load_file_config(
     return parse_file_config(text, default_timezone=_get(env, "TZ") or "UTC", vision=vision)
 
 
+def load_vision_config(env: Mapping[str, str] | None = None) -> VisionConfig:
+    """The ``VISION_*`` defaults a trigger inherits, read from the environment.
+
+    Separate from :func:`load_config` so that anything which only needs to
+    *understand* the triggers -- rebuilding the sheets, say -- can read their
+    defaults without Protect and MQTT credentials it has no use for.
+    """
+    env = os.environ if env is None else env
+    return _vision_config(env, _health_config(env))
+
+
 def load_report_config(path: Path, env: Mapping[str, str] | None = None) -> ReportConfig | None:
     """Read the ``reports:`` half of ``config.yaml``, or ``None`` if there is no file.
 

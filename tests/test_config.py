@@ -12,6 +12,7 @@ from unifi_occupancy.config import (
     Period,
     load_config,
     load_report_config,
+    load_vision_config,
     parse_report_config,
     period_bands,
 )
@@ -406,3 +407,11 @@ def test_an_empty_path_falls_back_to_the_default() -> None:
 def test_the_history_can_be_switched_off_for_every_trigger_by_env() -> None:
     assert load_config(MINIMAL).vision.record is True
     assert load_config({**MINIMAL, "VISION_RECORD_TRIGGERS": "false"}).vision.record is False
+
+
+def test_the_vision_defaults_can_be_read_without_protect_credentials() -> None:
+    """Rebuilding the sheets needs the triggers' defaults, not a controller."""
+    assert load_vision_config({}).record is True
+    assert load_vision_config({"VISION_RECORD_TRIGGERS": "false"}).record is False
+    # Still falls back to the health check's endpoint, as a trigger does.
+    assert load_vision_config({"CAMERA_HEALTH_MODEL": "llava"}).model == "llava"

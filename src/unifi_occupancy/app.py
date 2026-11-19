@@ -16,7 +16,7 @@ from .config import Config
 from .exporter import MetricsServer
 from .health import CameraHealthMonitor, VisionJudge
 from .metrics import OUTCOME_AUTH_ERROR, OUTCOME_ERROR, OUTCOME_SUCCESS, Metrics, default_metrics
-from .models import Camera, DetectionEvent
+from .models import Camera, DetectionEvent, trigger_kind
 from .protect import ProtectAuthError, ProtectClient, ProtectError
 from .publisher import AiomqttTransport, StatePublisher
 from .recorder import EventRecorder
@@ -173,6 +173,18 @@ class OccupancyService:
             backoff = min(backoff * 2, MAX_BACKOFF)
 
 
+def _trigger_holds(config: Config) -> dict[str, float]:
+    """How long each trigger's row may be held open by a run that never ended.
+
+    Its own interval: a match is believed until a later check contradicts it,
+    so the last moment there is evidence for is the check that would have come
+    next. Every trigger, not only the enabled ones -- the rows left open are
+    from the run before this one, which may have been asking a question this
+    one is not.
+    """
+    return {trigger_kind(trigger.key): trigger.interval_seconds for trigger in config.triggers}
+
+
 def _open_store(config: Config) -> EventStore | None:
     """The history database, or ``None`` when the sheets are switched off."""
     reports = config.reports
@@ -183,7 +195,7 @@ def _open_store(config: Config) -> EventStore | None:
         logger.info("occupancy sheets disabled in %s", config.config_file)
         return None
     store = EventStore(reports.database)
-    store.close_open_events(config.detection_hold_seconds)
+    store.close_open_events(config.detection_hold_seconds, _trigger_holds(config))
     logger.info(
         "recording occupancy history to %s, sheets in %s (%s)",
         reports.database,

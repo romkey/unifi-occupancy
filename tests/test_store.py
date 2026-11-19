@@ -81,6 +81,30 @@ def test_open_events_are_closed_at_the_hold_time(store: EventStore) -> None:
     assert store.close_open_events(30.0) == 0
 
 
+def test_a_trigger_left_open_is_cut_at_its_own_interval(store: EventStore) -> None:
+    """The detection hold is the wrong ruler: it would store an hour as a blip."""
+    store.start_event("cam-1", "Front Door", "motion", T0)
+    store.start_event("cam-1", "Front Door", "trigger:fire_or_smoke", T0)
+
+    assert store.close_open_events(30.0, {"trigger:fire_or_smoke": 900.0}) == 2
+
+    ends = {
+        event.kind: event.ended_at for event in store.events_between(T0, T0 + timedelta(hours=2))
+    }
+    assert ends["motion"] == T0 + timedelta(seconds=30)
+    assert ends["trigger:fire_or_smoke"] == T0 + timedelta(minutes=15)
+
+
+def test_a_kind_with_no_hold_of_its_own_falls_back_to_the_default(store: EventStore) -> None:
+    """A trigger from a run that asked a question this one does not."""
+    store.start_event("cam-1", "Front Door", "trigger:gone_away", T0)
+
+    assert store.close_open_events(30.0, {"trigger:fire_or_smoke": 900.0}) == 1
+
+    (event,) = store.events_between(T0, T0 + timedelta(hours=1))
+    assert event.ended_at == T0 + timedelta(seconds=30)
+
+
 def test_ending_an_event_that_never_started_is_harmless(store: EventStore) -> None:
     store.end_event("cam-1", "motion", T0)
 

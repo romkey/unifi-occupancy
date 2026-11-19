@@ -548,6 +548,10 @@ so the bar is how long the thing was *there*, not how often it was noticed. An `
 no snapshot, no endpoint, a reply nobody could read — leaves the lane exactly as it leaves
 the boolean: a gap in the record is not an all-clear, and the sheet will not draw one.
 
+A bar left open by a crash or a restart is cut one of that trigger's own intervals after it
+opened, since that is the last moment anything is known about: a match is believed until a
+later check contradicts it, and the check that would have contradicted it never ran.
+
 Four things follow from putting triggers in the detection log rather than a table of their
 own:
 
@@ -717,7 +721,9 @@ docker compose exec unifi-occupancy python -m unifi_occupancy --rebuild-sheets
 
 That reads the history and writes the pages; it needs neither the controller nor the
 broker. Cameras that have never fired are listed from the stored roster, so a rebuild looks
-the same as a live refresh.
+the same as a live refresh. It does read `config.yaml` and the `VISION_*` variables, since
+the trigger lanes are named and drawn from them — run it with the same environment the
+service runs with, which `docker compose exec` does for you.
 
 ## Prometheus metrics
 
