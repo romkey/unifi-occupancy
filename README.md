@@ -386,8 +386,8 @@ an older Home Assistant as well as a current one.
 It derives each trigger's status sensor and snapshot camera from the sensor that fired, so
 you select one set of entities rather than pairing three up by hand. It then exposes
 `trigger_name`, `camera_name`, `explanation`, `model`, `checked_at`, `snapshot_entity`,
-`image_url` and a ready-made `title`/`message` to whatever action you chose — so the
-notification above is three fields in a form:
+`image_url`, `object_id` and a ready-made `title`/`message` to whatever action you chose —
+so the notification above is three fields in a form:
 
 ```yaml
 action: notify.mobile_app_your_phone
@@ -398,7 +398,61 @@ data:
     image: "{{ image_url }}"
 ```
 
-Two options worth knowing. *Only when the model actually answered* adds the `match` check
+##### Slack
+
+`image_url` is no use to Slack. It is a path on your Home Assistant, and the Slack
+integration uploads a file itself rather than handing Slack a URL to fetch. So save the
+frame first, then send that:
+
+```yaml
+- if:
+    - condition: template
+      value_template: "{{ snapshot_entity != '' }}"
+  then:
+    - action: camera.snapshot
+      target:
+        entity_id: "{{ snapshot_entity }}"
+      data:
+        filename: "/config/trigger_snapshots/{{ object_id }}.jpg"
+- action: notify.your_slack_workspace
+  data:
+    title: "{{ title }}"
+    message: "{{ message }}"
+    data:
+      file:
+        path: "/config/trigger_snapshots/{{ object_id }}.jpg"
+```
+
+The notify action is named after your Slack workspace, not `notify.slack` — Developer Tools
+→ Actions, filter on `notify.`, and yours is in the list. A workspace with a default channel
+needs no `target`; add `target: "#doorbells"` to override it for one automation.
+
+`camera.snapshot` refuses a path outside the allowlist, so:
+
+```yaml
+homeassistant:
+  allowlist_external_dirs:
+    - /config/trigger_snapshots
+```
+
+**Not `/config/www`**, which is what most recipes online use. That directory is served at
+`/local/` with no authentication, so a frame of your doorway would be readable by anyone who
+can reach Home Assistant — which gives away for free what the unretained snapshot topic was
+careful about. Any other directory does, and the filename above is stable per camera per
+trigger, so the frames overwrite rather than piling up.
+
+Two further snags. Your Slack bot needs a file-upload scope (`files:write`); the
+integration's setup list does not mention one, so if the text arrives and the picture never
+does, look there first. And Slack ignores `blocks` when a `file` is attached, so rich
+formatting and the picture cannot be in one message.
+
+The `if` guard matters: `snapshot_entity` is empty for a trigger without
+`publish_snapshot: true`, and without the guard `camera.snapshot` errors and takes the
+message with it.
+
+##### The two options
+
+*Only when the model actually answered* adds the `match` check
 from the previous section, so a stale `ON` left over from before an outage cannot notify you
 again; it is on by default. *Quiet period* suppresses repeat matches for a while — rarely
 needed, since a trigger only fires on the way from `OFF` to `ON`, but useful for something

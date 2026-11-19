@@ -38,6 +38,8 @@ blueprint:
 
     - `image_url` — the path to attach to a notification, or empty
 
+    - `object_id` — the entity id without its domain, handy for a filename
+
     - `title`, `message` — a ready-made pair, if you do not want to write one
 
 
@@ -54,6 +56,12 @@ blueprint:
       data:
         image: "{{ image_url }}"
     ```
+
+
+    Slack wants a different shape: `image_url` is no use to it, because the
+    Slack integration uploads the file itself rather than fetching a URL. Save
+    the frame to disk first, then send that. The README has the whole recipe,
+    including the directory allowlisting it needs.
   domain: automation
   source_url: https://github.com/romkey/unifi-occupancy/blob/main/blueprints/automation/unifi_occupancy/trigger_notify.yaml
   input:
