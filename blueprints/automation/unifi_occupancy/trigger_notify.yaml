@@ -1,0 +1,169 @@
+# Notify when one of your custom camera triggers matches.
+#
+# Pick the triggers you care about, pick how you want to be told, and this
+# works out the rest: which camera matched, what the model said, and -- for a
+# trigger publishing frames -- the picture to attach.
+#
+# The entity ids this derives (the status sensor and the snapshot camera) follow
+# the layout unifi-occupancy announces over MQTT discovery. Rename those two
+# entities in Home Assistant and the derivation stops finding them, at which
+# point this degrades to a notification without the picture rather than failing.
+blueprint:
+  name: UniFi Occupancy — notify on a camera trigger
+  description: >-
+    Watch any number of custom camera triggers from unifi-occupancy and run a
+    notification when one of them matches.
+
+
+    Each trigger you select is a `binary_sensor` that goes `ON` when the vision
+    model could see what you described — a fire in a doorway, a gate left open,
+    a parcel on the step.
+
+
+    **Variables available inside your notification**, so you can write the
+    message you want:
+
+
+    - `trigger_name` — the trigger, as you named it in `config.yaml` ("Fire")
+
+    - `camera_name` — the camera it matched on ("Front Door")
+
+    - `explanation` — the model's own words ("flames on the doormat")
+
+    - `model` — which model answered
+
+    - `checked_at` — when it looked
+
+    - `snapshot_entity` — the camera entity holding the frame, or empty
+
+    - `image_url` — the path to attach to a notification, or empty
+
+    - `title`, `message` — a ready-made pair, if you do not want to write one
+
+
+    A mobile-app notification that carries the picture:
+
+
+    ```yaml
+
+    action: notify.mobile_app_your_phone
+
+    data:
+      title: "{{ title }}"
+      message: "{{ message }}"
+      data:
+        image: "{{ image_url }}"
+    ```
+  domain: automation
+  source_url: https://github.com/romkey/unifi-occupancy/blob/main/blueprints/automation/unifi_occupancy/trigger_notify.yaml
+  min_version: 2024.6.0
+  input:
+    watched:
+      name: Triggers to watch
+      description: >-
+        The trigger sensors to act on. These are the `binary_sensor` entities
+        named after your triggers — "Fire", "Gate left open". Pick as many as
+        you like; they can be different triggers on different cameras.
+      selector:
+        entity:
+          multiple: true
+          filter:
+            - domain: binary_sensor
+              integration: mqtt
+    notification:
+      name: How to tell you
+      description: >-
+        What to run when a trigger matches. Any action: a mobile push, a TTS
+        announcement, a light, a siren. The variables listed above are in scope.
+      selector:
+        action: {}
+    confirmed_only:
+      name: Only when the model actually answered
+      description: >-
+        A check that could not be made — camera offline, no snapshot, vision
+        server down, a reply nobody could read — publishes `unknown` and leaves
+        the boolean where it was. With this on, the automation also requires the
+        trigger's status sensor to read `match`, so a stale `ON` left over from
+        before an outage cannot notify you again. Leave it on unless you have
+        renamed the status sensors.
+      default: true
+      selector:
+        boolean: {}
+    attach_snapshot:
+      name: Attach the frame that matched
+      description: >-
+        Fill `image_url` with the matching frame when the trigger publishes one
+        (`publish_snapshot: true`). Without it, `image_url` is always empty and
+        your notification is text only.
+      default: true
+      selector:
+        boolean: {}
+    quiet_minutes:
+      name: Quiet period
+      description: >-
+        Ignore further matches for this long after notifying. A trigger only
+        fires on the way from `OFF` to `ON`, so a fire that stays visible does
+        not notify twice on its own — this is for something flickering in and
+        out of frame. Zero means notify every time.
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 240
+          unit_of_measurement: minutes
+          mode: box
+
+mode: queued
+max: 10
+max_exceeded: silent
+
+triggers:
+  - trigger: state
+    entity_id: !input watched
+    to: "on"
+
+variables:
+  confirmed_only: !input confirmed_only
+  attach_snapshot: !input attach_snapshot
+  quiet_minutes: !input quiet_minutes
+  # Everything below hangs off the object id of whichever sensor fired.
+  object_id: "{{ trigger.entity_id.split('.')[1] }}"
+  status_entity: "sensor.{{ object_id }}_status"
+  snapshot_candidate: "camera.{{ object_id }}_snapshot"
+  # `states[...]` is none for an entity that does not exist, which is how a
+  # renamed or absent companion entity is told apart from one reading unknown.
+  snapshot_entity: >-
+    {{ snapshot_candidate if attach_snapshot and states[snapshot_candidate] is not none else '' }}
+  image_url: "{{ '/api/camera_proxy/' ~ snapshot_entity if snapshot_entity else '' }}"
+  trigger_name: >-
+    {{ state_attr(trigger.entity_id, 'name')
+       or state_attr(trigger.entity_id, 'friendly_name')
+       or trigger.entity_id }}
+  camera_name: >-
+    {{ device_attr(trigger.entity_id, 'name_by_user')
+       or device_attr(trigger.entity_id, 'name')
+       or 'a camera' }}
+  explanation: "{{ state_attr(trigger.entity_id, 'explanation') or '' }}"
+  model: "{{ state_attr(trigger.entity_id, 'model') or '' }}"
+  checked_at: "{{ state_attr(trigger.entity_id, 'checked_at') or '' }}"
+  title: "{{ trigger_name }} — {{ camera_name }}"
+  message: >-
+    {{ explanation if explanation else trigger_name ~ ' matched on ' ~ camera_name }}
+
+conditions:
+  # Require a real `match` rather than a boolean that happens to be ON. Skipped
+  # when the status sensor is missing, so renaming it loses the check instead of
+  # silently stopping every notification.
+  - condition: template
+    value_template: >-
+      {{ not confirmed_only
+         or states[status_entity] is none
+         or states(status_entity) == 'match' }}
+  - condition: template
+    value_template: >-
+      {{ quiet_minutes | int(0) == 0
+         or this.attributes.last_triggered is none
+         or (now() - this.attributes.last_triggered).total_seconds()
+            > quiet_minutes | int(0) * 60 }}
+
+actions: !input notification
