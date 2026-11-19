@@ -549,8 +549,11 @@ no snapshot, no endpoint, a reply nobody could read — leaves the lane exactly 
 the boolean: a gap in the record is not an all-clear, and the sheet will not draw one.
 
 A bar left open by a crash or a restart is cut one of that trigger's own intervals after it
-opened, since that is the last moment anything is known about: a match is believed until a
-later check contradicts it, and the check that would have contradicted it never ran.
+opened, or at the moment the process stopped looking, whichever came first — that is the
+last moment anything is known about, since a match is believed until a later check
+contradicts it and the check that would have contradicted it never ran. A restart in the
+middle of a match therefore leaves two bars with a gap between them, which is what actually
+happened: nobody was looking.
 
 Four things follow from putting triggers in the detection log rather than a table of their
 own:
