@@ -105,6 +105,25 @@ groups:
 #     cameras: ALL
 #     # How often each of those cameras is checked. Default 15.
 #     interval_minutes: 5
+#     # Instead of the interval above, ask only when Protect reports one of
+#     # these starting on that same camera: motion, person, siren, smoke. Any
+#     # one of them is enough -- it is an or, not an and. Leave it out to run
+#     # on the interval, which is what every trigger does by default.
+#     #
+#     # A fire question on eight cameras every five minutes is 2,304 vision
+#     # calls a day whether anything moved or not. What it costs is coverage:
+#     # nothing that does not move is ever looked at, and the trigger has no
+#     # state at all until its first event. Needs the Protect event stream
+#     # (PROTECT_USE_WEBSOCKET), which is on by default.
+#     on_events:
+#       - motion
+#       - person
+#     # With on_events, the shortest gap between two checks of one camera.
+#     # Motion arrives in bursts -- a car going past is a dozen events in
+#     # ninety seconds -- and this is what stops each one costing a call. Per
+#     # camera, so a burst at the door does not delay the gate. Defaults to
+#     # interval_minutes above.
+#     cooldown_minutes: 2
 #     # Home Assistant device class for the binary sensor: problem, smoke,
 #     # safety, door, ... Leave it out for a classless sensor.
 #     device_class: problem

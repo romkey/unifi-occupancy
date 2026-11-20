@@ -101,6 +101,10 @@ def service_info_payload(
             # Whether any trigger answer is being written to disk, which is
             # the other thing about a trigger that outlives the moment.
             "trigger_history": bool(_recorded(config)),
+            # Whether anything is asking its question on detections rather
+            # than on a clock, which is what makes the call count on the
+            # metrics unpredictable from the intervals alone.
+            "demand_triggers": any(trigger.on_demand for trigger in config.active_triggers),
             "metrics": config.metrics.enabled,
         },
         "detections": list(DETECTION_KEYS),
@@ -118,6 +122,11 @@ def service_info_payload(
                 "key": trigger.key,
                 "cameras": "all" if trigger.all_cameras else list(trigger.cameras),
                 "interval_minutes": trigger.interval_minutes,
+                # Empty means the interval above is the whole schedule. With
+                # detections listed, the interval is only what the cooldown
+                # falls back to and the trigger is asked on those instead.
+                "on_events": list(trigger.on_events),
+                "cooldown_minutes": trigger.cooldown_seconds / 60.0 if trigger.on_demand else None,
                 "model": trigger.model,
                 "publish_snapshot": trigger.publish_snapshot,
                 "batch": trigger.batch,

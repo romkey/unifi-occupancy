@@ -7,7 +7,7 @@ import contextlib
 import logging
 import ssl
 import time
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Collection, Mapping
 from typing import Any
 
 import aiomqtt
@@ -77,6 +77,15 @@ class OccupancyService:
         self._tracker = DetectionTracker(hold_seconds=config.detection_hold_seconds)
         self._cameras: dict[str, Camera] = {}
         self._lock = asyncio.Lock()
+        self._on_demand: list[TriggerWatcher] = []
+
+    def watch_on_demand(self, watcher: TriggerWatcher) -> None:
+        """Offer this watcher every detection that starts, as it arrives.
+
+        Registered rather than passed in because the watchers need the camera
+        inventory this service owns, so one of the two has to exist first.
+        """
+        self._on_demand.append(watcher)
 
     @property
     def cameras(self) -> dict[str, Camera]:
@@ -90,6 +99,8 @@ class OccupancyService:
             gone = [camera for cid, camera in self._cameras.items() if cid not in seen]
             if gone:
                 self._tracker.forget(camera.id for camera in gone)
+                for watcher in self._on_demand:
+                    watcher.forget(camera.id for camera in gone)
                 if self._recorder is not None:
                     self._recorder.forget(frozenset(camera.id for camera in gone))
                 await self._publisher.retract(gone)
@@ -123,6 +134,24 @@ class OccupancyService:
                     logger.debug("event for unknown camera %s", event.camera_id)
                     continue
                 await self._publish_locked([camera])
+                if event.start:
+                    self._offer(camera, event.keys)
+
+    def _offer(self, camera: Camera, keys: Collection[str]) -> None:
+        """Tell the demand watchers a detection just started on this camera.
+
+        Starts only. A detection ending is not a reason to look at anything:
+        the question a trigger asks is about what is in the frame now, and
+        "the motion stopped" is the moment there is least to see.
+
+        Deliberately non-blocking, and called while the inventory lock is
+        held: each watcher does nothing more than decide whether the camera is
+        due and put its id on a queue. The snapshot and the vision call happen
+        in the watcher's own task, so a slow model can never back up the event
+        stream.
+        """
+        for watcher in self._on_demand:
+            watcher.demand(camera, keys)
 
     async def poll_forever(self) -> None:
         while True:
@@ -176,13 +205,13 @@ class OccupancyService:
 def _trigger_holds(config: Config) -> dict[str, float]:
     """How long each trigger's row may be held open by a run that never ended.
 
-    Its own interval: a match is believed until a later check contradicts it,
-    so the last moment there is evidence for is the check that would have come
-    next. Every trigger, not only the enabled ones -- the rows left open are
-    from the run before this one, which may have been asking a question this
-    one is not.
+    Its own interval -- or its cooldown, for a trigger that runs on demand: a
+    match is believed until a later check contradicts it, so the last moment
+    there is evidence for is the soonest a check could have followed. Every
+    trigger, not only the enabled ones -- the rows left open are from the run
+    before this one, which may have been asking a question this one is not.
     """
-    return {trigger_kind(trigger.key): trigger.interval_seconds for trigger in config.triggers}
+    return {trigger_kind(trigger.key): trigger.history_hold_seconds for trigger in config.triggers}
 
 
 def _open_store(config: Config) -> EventStore | None:
@@ -307,31 +336,59 @@ async def _serve(
                 metrics=metrics,
                 recorder=recorder,
             )
-            tasks.append(
-                asyncio.create_task(
-                    watcher.run_forever(lambda: list(service.cameras.values())),
-                    name=watcher.job,
+            if watcher.on_demand:
+                service.watch_on_demand(watcher)
+                tasks.append(
+                    asyncio.create_task(
+                        watcher.run_on_demand(lambda: list(service.cameras.values())),
+                        name=watcher.job,
+                    )
                 )
-            )
+            else:
+                tasks.append(
+                    asyncio.create_task(
+                        watcher.run_forever(lambda: list(service.cameras.values())),
+                        name=watcher.job,
+                    )
+                )
             if len(group) > 1:
                 logger.info(
-                    "asking %s together every %g minute(s) with %s at %s -- "
+                    "asking %s together %s with %s at %s -- "
                     "one frame and one request covers all %d",
                     ", ".join(repr(trigger.name) for trigger in group),
-                    lead.interval_minutes,
+                    (
+                        f"on {' or '.join(lead.on_events)}"
+                        if lead.on_demand
+                        else f"every {lead.interval_minutes:g} minute(s)"
+                    ),
                     lead.model,
                     lead.base_url,
                     len(group),
                 )
             for trigger in group:
-                logger.info(
-                    "watching %s for %r every %g minute(s) with %s at %s",
-                    "every camera" if trigger.all_cameras else ", ".join(trigger.cameras),
-                    trigger.name,
-                    trigger.interval_minutes,
-                    trigger.model,
-                    trigger.base_url,
-                )
+                if trigger.on_demand:
+                    logger.info(
+                        "watching %s for %r on %s, at most every %g minute(s), with %s at %s",
+                        "every camera" if trigger.all_cameras else ", ".join(trigger.cameras),
+                        trigger.name,
+                        " or ".join(trigger.on_events),
+                        (
+                            trigger.cooldown_minutes
+                            if trigger.cooldown_minutes is not None
+                            else trigger.interval_minutes
+                        ),
+                        trigger.model,
+                        trigger.base_url,
+                    )
+                else:
+                    logger.info(
+                        "watching %s for %r every %g minute(s) with %s at %s",
+                        "every camera" if trigger.all_cameras else ", ".join(trigger.cameras),
+                        trigger.name,
+                        trigger.interval_minutes,
+                        trigger.model,
+                        trigger.base_url,
+                    )
                 if trigger.publish_snapshot:
                     # Said out loud at startup, on purpose: this is the one
                     # setting that puts a picture on the broker, and whoever
@@ -345,6 +402,18 @@ async def _serve(
                     )
         if config.protect.use_websocket:
             tasks.append(asyncio.create_task(service.watch_events_forever(), name="events"))
+        elif any(trigger.on_demand for trigger in config.active_triggers):
+            # Said loudly because the symptom is silence: a trigger in this
+            # mode asks nothing at all until a detection arrives, and with the
+            # websocket off none ever will. Polling cannot stand in -- it
+            # reports what is happening now, not that something started.
+            logger.warning(
+                "%s run on detections, but the Protect event stream is switched off "
+                "(PROTECT_USE_WEBSOCKET); they will never be asked",
+                ", ".join(
+                    repr(trigger.name) for trigger in config.active_triggers if trigger.on_demand
+                ),
+            )
         if store is not None and config.reports is not None:
             writer = SheetWriter(
                 store,

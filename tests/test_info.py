@@ -64,6 +64,7 @@ def test_service_info_reports_versions_and_features(config: Config) -> None:
         "custom_triggers": False,
         "trigger_snapshots": False,
         "trigger_history": False,
+        "demand_triggers": False,
         "metrics": False,
     }
     assert payload["cameras"] == 3

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from collections.abc import AsyncIterator
 from dataclasses import replace
@@ -18,6 +19,7 @@ from unifi_occupancy.protect import ProtectError
 from unifi_occupancy.publisher import StatePublisher
 from unifi_occupancy.recorder import EventRecorder
 from unifi_occupancy.store import EventStore
+from unifi_occupancy.triggers import MATCH, TriggerAnswer, TriggerWatcher
 
 
 class FakeProtect:
@@ -382,3 +384,169 @@ async def test_a_failing_poll_is_counted_and_lowers_protect_up(
 
     assert metrics.protect_up.value() == 0
     assert metrics.job_runs.value(job="poll", outcome="success") == 0
+
+
+class FakeDemand:
+    """Stands in for a :class:`TriggerWatcher` running on demand."""
+
+    def __init__(self) -> None:
+        self.offered: list[tuple[str, tuple[str, ...]]] = []
+        self.forgotten: list[str] = []
+
+    def demand(self, camera, keys) -> bool:
+        self.offered.append((camera.name, tuple(sorted(keys))))
+        return True
+
+    def forget(self, camera_ids) -> None:
+        self.forgotten += list(camera_ids)
+
+
+async def test_a_detection_starting_is_offered_to_the_demand_watchers(
+    config: Config, transport: FakeTransport
+) -> None:
+    service, _ = service_for(config, transport, [[camera_payload()]])
+    watcher = FakeDemand()
+    service.watch_on_demand(watcher)
+    await service.refresh()
+
+    await service.handle_events(events_from(DetectionEvent("cam-1", frozenset({MOTION, PERSON}))))
+
+    assert watcher.offered == [("Front Door", (MOTION, PERSON))]
+
+
+async def test_a_detection_ending_is_not_a_reason_to_look(
+    config: Config, transport: FakeTransport
+) -> None:
+    """The question is about what is in the frame, and that is when there is least."""
+    service, _ = service_for(config, transport, [[camera_payload()]])
+    watcher = FakeDemand()
+    service.watch_on_demand(watcher)
+    await service.refresh()
+
+    await service.handle_events(
+        events_from(DetectionEvent("cam-1", frozenset({MOTION}), start=False))
+    )
+
+    assert watcher.offered == []
+
+
+async def test_a_detection_for_a_camera_we_do_not_know_is_not_offered(
+    config: Config, transport: FakeTransport
+) -> None:
+    service, _ = service_for(config, transport, [[camera_payload()]])
+    watcher = FakeDemand()
+    service.watch_on_demand(watcher)
+    await service.refresh()
+
+    await service.handle_events(events_from(DetectionEvent("ghost", frozenset({MOTION}))))
+
+    assert watcher.offered == []
+
+
+async def test_a_camera_that_goes_away_loses_its_cooldown(
+    config: Config, transport: FakeTransport
+) -> None:
+    service, _ = service_for(
+        config,
+        transport,
+        [[camera_payload(), camera_payload(id="cam-2", name="Back Yard")], [camera_payload()]],
+    )
+    watcher = FakeDemand()
+    service.watch_on_demand(watcher)
+
+    await service.refresh()
+    assert watcher.forgotten == []
+    await service.refresh()
+
+    assert watcher.forgotten == ["cam-2"]
+
+
+def test_a_demand_trigger_left_open_is_cut_at_its_cooldown(config: Config, tmp_path: Path) -> None:
+    """Its own ruler: a trigger nothing triggered is a trigger nobody asked."""
+    database = tmp_path / "history.sqlite3"
+    started = datetime.now(tz=UTC) - timedelta(hours=3)
+    with EventStore(database) as previous:
+        previous.start_event("cam-1", "Front Door", trigger_kind("fire_or_smoke"), started)
+
+    store = _open_store(
+        replace(
+            config,
+            reports=ReportConfig(database=database),
+            triggers=(
+                TriggerConfig(
+                    name="Fire or smoke",
+                    prompt="?",
+                    interval_minutes=15.0,
+                    on_events=(MOTION,),
+                    cooldown_minutes=2.0,
+                ),
+            ),
+        )
+    )
+
+    assert store is not None
+    try:
+        (event,) = store.events_between(started - timedelta(hours=1), datetime.now(tz=UTC))
+        assert event.ended_at == started + timedelta(minutes=2)
+    finally:
+        store.close()
+
+
+class StillSnapshots:
+    async def get_snapshot(self, camera_id: str, *, high_quality: bool = False) -> bytes:
+        return b"\xff\xd8\xff\xe0 a frame"
+
+
+class SayingYes:
+    async def evaluate(self, image: bytes, **kwargs) -> TriggerAnswer:
+        return TriggerAnswer(MATCH, "flames on the doormat")
+
+    async def evaluate_batch(self, image: bytes, triggers, **kwargs):
+        return {trigger.key: TriggerAnswer(MATCH) for trigger in triggers}
+
+
+async def test_a_detection_carries_all_the_way_to_a_published_answer(
+    config: Config, transport: FakeTransport
+) -> None:
+    """The whole path: a Protect event, a vision call, a boolean on the broker.
+
+    The wiring in ``_serve`` that starts this loop is the one part no test
+    reaches, so the contract either side of it is pinned here instead: the
+    service offers the detection, and the watcher turns it into a publish.
+    """
+    clock = Clock()
+    publisher = StatePublisher(config, transport)
+    service = OccupancyService(config, FakeProtect([[camera_payload()]]), publisher, clock=clock)
+    watcher = TriggerWatcher(
+        TriggerConfig(name="Fire", prompt="?", on_events=(MOTION,), cooldown_minutes=5.0),
+        StillSnapshots(),
+        publisher,
+        SayingYes(),
+        clock=clock,
+    )
+    service.watch_on_demand(watcher)
+    topic = "unifi-occupancy/front_door/trigger/fire"
+    await service.refresh()
+    # Nothing has looked yet, so the sensor has no state at all.
+    assert not transport.sent(topic)
+
+    await service.handle_events(events_from(DetectionEvent("cam-1", frozenset({MOTION}))))
+    loop = asyncio.create_task(watcher.run_on_demand(lambda: list(service.cameras.values())))
+    try:
+        for _ in range(500):
+            if transport.sent(topic):
+                break
+            await asyncio.sleep(0)
+
+        assert transport.payload_for(topic) == "ON"
+
+        # And the burst behind it costs nothing: one answer, not two.
+        clock.advance(10.0)
+        await service.handle_events(events_from(DetectionEvent("cam-1", frozenset({MOTION}))))
+        for _ in range(100):
+            await asyncio.sleep(0)
+        assert transport.topics.count(topic) == 1
+    finally:
+        loop.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await loop

@@ -6,13 +6,22 @@ actually happen in a doorway: a fire set on the step, a gate left open, a parcel
 nobody collected, a van parked across the drive. Those are visible in a frame
 and nowhere in the API.
 
-So a trigger is a name and a question. Every ``interval_minutes`` this takes one
-snapshot of each camera the trigger names, puts the question to a vision model,
-and publishes the answer as a boolean on
+So a trigger is a name and a question. Every ``interval_minutes`` -- or, with
+``on_events``, whenever Protect reports one of those detections starting on
+that camera -- this takes one snapshot of each camera the trigger names, puts
+the question to a vision model, and publishes the answer as a boolean on
 ``<prefix>/<camera>/trigger/<name>`` -- ``ON`` while the model says it can see
 what was described, ``OFF`` while it says it cannot. Home Assistant gets a
 binary sensor per camera per trigger, and an automation can act on a fire at the
 front door the same way it acts on motion.
+
+Which of the two paces a trigger is the one thing it cannot do both of. A
+question on a clock is asked whether or not there is anything to see, which on
+eight cameras every five minutes is a couple of thousand pictures of an empty
+driveway a day; a question on demand costs nothing until something moves, and
+in exchange never looks at anything that does not. The cooldown is what keeps
+the second one honest, since motion arrives in bursts and a vision call per
+event would be worse than the polling it replaced.
 
 The same cautions as the camera health check apply, and for the same reason:
 this is one of the two features that touches an image. By default a snapshot
@@ -34,7 +43,7 @@ import asyncio
 import logging
 import re
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import TracebackType
@@ -44,6 +53,9 @@ import httpx
 
 from .config import TriggerConfig
 from .metrics import (
+    DEMAND_ADMITTED,
+    DEMAND_PENDING,
+    DEMAND_THROTTLED,
     OUTCOME_ERROR,
     OUTCOME_SUCCESS,
     OUTCOME_UNREADABLE,
@@ -570,6 +582,17 @@ class TriggerWatcher:
         self._clock = clock
         self._is_current = is_current
         self._metrics = metrics or default_metrics()
+        #: Cameras waiting for a demand check, oldest first.
+        #:
+        #: Unbounded, and it does not need a bound: a camera already on it is
+        #: never put on it again, so the most it can hold is one entry per
+        #: camera. :attr:`_pending` is what makes that true.
+        self._demand: asyncio.Queue[str] = asyncio.Queue()
+        #: The ids currently on that queue.
+        self._pending: set[str] = set()
+        #: camera id -> clock reading when this camera was last looked at:
+        #: admitted, and then again when its check actually started.
+        self._looked: dict[str, float] = {}
 
     @property
     def config(self) -> TriggerConfig:
@@ -600,6 +623,94 @@ class TriggerWatcher:
     def job(self) -> str:
         """A name for the asyncio task. Not a metric label."""
         return "trigger:" + "+".join(trigger.key for trigger in self._triggers)
+
+    @property
+    def on_demand(self) -> bool:
+        """Whether this group is driven by detections rather than by a clock."""
+        return self._config.on_demand
+
+    def wants(self, camera: Camera, keys: Iterable[str]) -> tuple[TriggerConfig, ...]:
+        """The members that would ask about ``camera`` given these detections.
+
+        A member has to both watch the camera and listen for at least one of
+        the detections. The group agrees on what it listens for -- that is
+        part of :attr:`~unifi_occupancy.config.TriggerConfig.batch_key` -- but
+        not on its camera list, so this can be empty for a camera the group as
+        a whole does watch.
+        """
+        if not self.on_demand:
+            return ()
+        wanted = tuple(keys)
+        return tuple(
+            trigger
+            for trigger in self.triggers_for(camera)
+            if any(trigger.wants_event(key) for key in wanted)
+        )
+
+    def demand(self, camera: Camera, keys: Iterable[str]) -> bool:
+        """Note a detection that may be worth a check. Never blocks, never raises.
+
+        Called from the event loop that is reading Protect's websocket, so it
+        does the cheap part only: decide whether this camera is due and put its
+        id on the queue. The snapshot and the model happen in
+        :meth:`run_on_demand`, where taking a minute does not hold up the next
+        event.
+
+        ``True`` when a check was admitted. Two things can decline one. A
+        camera already on the queue is not put on it twice, however long it
+        has been waiting: it is going to be looked at, and the answer will be
+        about the frame as it is then rather than as it was when the detection
+        arrived. And a camera looked at too recently waits -- where "looked
+        at" means admitted *or* checked, whichever came last, because the two
+        can be minutes apart when the endpoint is slow and the limit the
+        cooldown is for is on the vision calls, not on the queueing.
+        """
+        asking = self.wants(camera, keys)
+        if not asking:
+            return False
+        if camera.id in self._pending:
+            self._declined(asking, DEMAND_PENDING)
+            logger.debug("%s is already waiting for its %s check", camera.name, self.job)
+            return False
+        now = self._clock()
+        last = self._looked.get(camera.id)
+        cooldown = self._config.cooldown_seconds
+        if last is not None and now - last < cooldown:
+            self._declined(asking, DEMAND_THROTTLED)
+            logger.debug(
+                "%s on %s is inside its %gs cooldown; not checking",
+                self.job,
+                camera.name,
+                cooldown,
+            )
+            return False
+        self._looked[camera.id] = now
+        for trigger in asking:
+            self._metrics.record_trigger_demand(trigger.key, DEMAND_ADMITTED)
+        self._pending.add(camera.id)
+        self._demand.put_nowait(camera.id)
+        return True
+
+    def _declined(self, asking: Sequence[TriggerConfig], outcome: str) -> None:
+        for trigger in asking:
+            self._metrics.record_trigger_demand(trigger.key, outcome)
+
+    def forget(self, camera_ids: Iterable[str]) -> None:
+        """Drop the cooldown state of cameras that have gone away.
+
+        A camera id that comes back -- a camera renamed, or Protect restarted
+        -- should not inherit a cooldown from before it left.
+
+        What a camera cannot be forgiven is a check it is already waiting
+        for. Nothing can reach into the middle of a queue, so an entry filed
+        before it left is still there and still live: a camera that flaps
+        would otherwise be admitted a second time behind its own first entry
+        and checked twice in a row. The entry is dropped where it is reached,
+        in :meth:`run_on_demand`, which is the only place that can tell
+        whether the camera answers to that id by then.
+        """
+        for camera_id in camera_ids:
+            self._looked.pop(camera_id, None)
 
     def selects(self, camera: Camera) -> bool:
         return any(self.triggers_for(camera))
@@ -762,17 +873,23 @@ class TriggerWatcher:
         for index, camera in enumerate(self.cameras_for(cameras)):
             if index and self._config.stagger_seconds > 0:
                 await self._sleep(self._config.stagger_seconds)
-            if not self._still_there(camera):
-                logger.debug("%s went away before its %s check", camera.name, self.job)
-                continue
-            checked = await self.check_camera(camera)
-            if not self._still_there(camera):
-                logger.debug("%s went away during its %s check", camera.name, self.job)
-                continue
-            for result, image in checked:
-                results.append(result)
-                await self._sink.publish_trigger(camera, result, image)
-                self._record(camera, result)
+            results += await self.visit(camera)
+        return results
+
+    async def visit(self, camera: Camera) -> list[TriggerResult]:
+        """One camera: ask, publish, record. The unit of work in both modes."""
+        if not self._still_there(camera):
+            logger.debug("%s went away before its %s check", camera.name, self.job)
+            return []
+        checked = await self.check_camera(camera)
+        if not self._still_there(camera):
+            logger.debug("%s went away during its %s check", camera.name, self.job)
+            return []
+        results: list[TriggerResult] = []
+        for result, image in checked:
+            results.append(result)
+            await self._sink.publish_trigger(camera, result, image)
+            self._record(camera, result)
         return results
 
     def _record(self, camera: Camera, result: TriggerResult) -> None:
@@ -790,6 +907,8 @@ class TriggerWatcher:
 
     async def run_forever(self, cameras: Callable[[], Sequence[Camera]]) -> None:
         """Sweep, wait out the interval, sweep again, until cancelled."""
+        if self.on_demand:  # pragma: no cover - a wiring mistake, not a path
+            raise RuntimeError(f"{self.job} runs on demand; use run_on_demand")
         while True:
             batch = cameras()
             if not batch:
@@ -797,20 +916,55 @@ class TriggerWatcher:
                 await self._sleep(min(5.0, self._config.interval_seconds))
                 continue
             started = self._clock()
-            for job in self.jobs:
-                self._metrics.start_job(job)
-            try:
-                await self.sweep(batch)
-            except asyncio.CancelledError:
-                for job in self.jobs:
-                    self._metrics.job_in_progress.set(0, job=job)
-                raise
-            except Exception:
-                taken = max(0.0, self._clock() - started)
-                for job in self.jobs:
-                    self._metrics.finish_job(job, OUTCOME_ERROR, taken)
-                raise
-            elapsed = self._clock() - started
-            for job in self.jobs:
-                self._metrics.finish_job(job, OUTCOME_SUCCESS, max(0.0, elapsed))
+            elapsed = await self._timed(self.sweep(batch), started)
             await self._sleep(max(1.0, self._config.interval_seconds - elapsed))
+
+    async def run_on_demand(self, cameras: Callable[[], Sequence[Camera]]) -> None:
+        """Check the cameras :meth:`demand` admits, until cancelled.
+
+        One consumer, so two checks never overlap and the vision endpoint sees
+        the same one-at-a-time load the interval sweep gave it. A camera is
+        looked up again here rather than carried on the queue: a check admitted
+        a minute ago should use the camera as it is now, and one whose camera
+        has since gone is dropped.
+        """
+        while True:
+            camera_id = await self._demand.get()
+            self._pending.discard(camera_id)
+            camera = next((item for item in cameras() if item.id == camera_id), None)
+            if camera is None:
+                logger.debug("%s was asked about %s, which has gone", self.job, camera_id)
+                continue
+            started = self._clock()
+            # The cooldown runs from here, not from when this was admitted. A
+            # check that waited out a backlog has only just looked, and the
+            # next detection should wait a cooldown from *that* -- otherwise
+            # two checks of one camera run back to back, which is the overhead
+            # this mode exists to avoid.
+            self._looked[camera_id] = started
+            await self._timed(self.visit(camera), started)
+
+    async def _timed(self, work: Awaitable[object], started: float) -> float:
+        """Run one unit of work with the job gauges around it, and time it.
+
+        Both loops report per member, not per group, for the reason
+        :attr:`jobs` gives: ``trigger:fire`` is the series someone graphs, and
+        it should not disappear because a second trigger joined the call.
+        """
+        for job in self.jobs:
+            self._metrics.start_job(job)
+        try:
+            await work
+        except asyncio.CancelledError:
+            for job in self.jobs:
+                self._metrics.job_in_progress.set(0, job=job)
+            raise
+        except Exception:
+            taken = max(0.0, self._clock() - started)
+            for job in self.jobs:
+                self._metrics.finish_job(job, OUTCOME_ERROR, taken)
+            raise
+        elapsed = max(0.0, self._clock() - started)
+        for job in self.jobs:
+            self._metrics.finish_job(job, OUTCOME_SUCCESS, elapsed)
+        return elapsed

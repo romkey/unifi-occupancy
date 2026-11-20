@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
-from .models import slugify
+from .models import DETECTION_KEYS, classify, slugify
 
 DEFAULT_MQTT_PORT = 1883
 DEFAULT_MQTT_TLS_PORT = 8883
@@ -281,6 +281,38 @@ class TriggerConfig:
     #: remove the ones already written, which age out with ``retention_days``
     #: like everything else in the log.
     record: bool = True
+    #: Detections that make this trigger ask its question, instead of a clock.
+    #:
+    #: Empty -- the default -- means the trigger runs on :attr:`interval_minutes`
+    #: and nothing else, exactly as it always has. Naming any detection here
+    #: switches the trigger to demand: the question is put to a camera when
+    #: Protect reports one of these starting on *that* camera, and at no other
+    #: time. The two modes are exclusive, because a trigger that did both would
+    #: be a trigger whose interval you could not read off its config.
+    #:
+    #: Any of the four detection keys -- ``motion``, ``person``, ``siren``,
+    #: ``smoke`` -- and the list is an *or*: any one of them is enough. A
+    #: trigger listening for motion and person fires on whichever Protect
+    #: reports first, and does not wait for the other.
+    #:
+    #: The point is overhead. A fire question asked of eight cameras every five
+    #: minutes is 2,304 vision calls a day whether anything moved or not; asked
+    #: only when something moves, it is a few dozen. What it costs is latency
+    #: and coverage: nothing that does not move is ever looked at, so a gate
+    #: that has been open all night is not noticed until something walks past
+    #: it, and a trigger in this mode has no state at all until its first
+    #: event.
+    on_events: tuple[str, ...] = ()
+    #: The shortest gap between two demand checks of the same camera.
+    #:
+    #: ``None`` means :attr:`interval_minutes`, which is the right default: it
+    #: is already the rate you were willing to ask at. This exists because
+    #: motion does not arrive as one event -- a car down the street is a dozen
+    #: of them in ninety seconds, and one vision call each would be worse than
+    #: the polling this mode replaced. The first event in a quiet window is
+    #: checked and the rest are dropped on the floor, per camera, so a burst at
+    #: the front door costs one call and does not delay the gate.
+    cooldown_minutes: float | None = None
     #: Whether this trigger may share a vision call with others like it.
     #:
     #: On by default. Triggers that match on :attr:`batch_key` -- same
@@ -298,6 +330,35 @@ class TriggerConfig:
     @property
     def interval_seconds(self) -> float:
         return self.interval_minutes * 60.0
+
+    @property
+    def on_demand(self) -> bool:
+        """Whether this trigger is driven by events rather than by a clock."""
+        return bool(self.on_events)
+
+    @property
+    def cooldown_seconds(self) -> float:
+        """The shortest gap between two demand checks of one camera."""
+        if self.cooldown_minutes is None:
+            return self.interval_seconds
+        return self.cooldown_minutes * 60.0
+
+    @property
+    def history_hold_seconds(self) -> float:
+        """How long a row of this trigger's left open by a crash may be held.
+
+        The soonest a check could have followed the one that opened it, which
+        is the last moment there is any evidence for -- the interval on a
+        clock, the cooldown on demand. Demand understates a long match, since
+        a trigger nothing triggered is a trigger nobody asked: that is the
+        mode's own blind spot and not something the history can invent its way
+        out of.
+        """
+        return self.cooldown_seconds if self.on_demand else self.interval_seconds
+
+    def wants_event(self, key: str) -> bool:
+        """Whether a detection of ``key`` starting is worth a check."""
+        return key in self.on_events
 
     @property
     def all_cameras(self) -> bool:
@@ -329,7 +390,9 @@ class TriggerConfig:
     def batch_key(self) -> tuple[object, ...]:
         """What has to match for two triggers to share a call.
 
-        The interval, because a shared call is a shared schedule. The endpoint,
+        The interval and what the trigger listens for, because a shared call
+        is a shared schedule -- and in demand mode the cooldown too, since the
+        group is throttled as one. The endpoint,
         key and model, because the call goes to exactly one of them. The
         snapshot quality, because there is one frame. Everything else --
         device class, explanation length, whether the frame is published -- is
@@ -338,6 +401,8 @@ class TriggerConfig:
         """
         return (
             self.interval_minutes,
+            self.on_events,
+            self.cooldown_minutes,
             self.base_url,
             self.api_key,
             self.model,
@@ -640,6 +705,7 @@ def _parse_triggers(raw: object, defaults: VisionConfig) -> tuple[TriggerConfig,
             raise ConfigError(f"{where}.name must contain a letter or a digit")
         if "prompt" not in entry:
             raise ConfigError(f"{where} needs a prompt saying what to look for")
+        on_events = _parse_trigger_events(entry.get("on_events"), where)
         base_url = _yaml_str(entry, "api_base_url", defaults.base_url, where)
         if not base_url.startswith(("http://", "https://")):
             raise ConfigError(f"{where}.api_base_url must be an http(s) URL, got {base_url!r}")
@@ -679,6 +745,8 @@ def _parse_triggers(raw: object, defaults: VisionConfig) -> tuple[TriggerConfig,
                 publish_snapshot=_yaml_bool(entry, "publish_snapshot", False, where),
                 device_class=_yaml_optional_str(entry, "device_class", None, where),
                 append_answer_format=_yaml_bool(entry, "append_answer_format", True, where),
+                on_events=on_events,
+                cooldown_minutes=_parse_cooldown(entry, where, on_events),
                 batch=_yaml_bool(entry, "batch", defaults.batch, where),
                 record=_yaml_bool(entry, "record", defaults.record, where),
             )
@@ -688,6 +756,61 @@ def _parse_triggers(raw: object, defaults: VisionConfig) -> tuple[TriggerConfig,
     if duplicate is not None:
         raise ConfigError(f"two triggers resolve to the same name: {duplicate!r}")
     return tuple(triggers)
+
+
+def _parse_trigger_events(raw: object, where: str) -> tuple[str, ...]:
+    """``on_events:`` -- the detections that make this trigger ask, if any.
+
+    Absent means the trigger runs on its interval, which is how every trigger
+    written before this existed keeps working. Written out empty is a mistake
+    rather than a way of saying "no events", and is rejected as one.
+
+    Names are read the same way Protect's own event payloads are, so
+    ``people`` and ``person`` both mean the person detection. The result is
+    ordered by :data:`~unifi_occupancy.models.DETECTION_KEYS` and deduplicated,
+    which matters only because it is part of
+    :attr:`TriggerConfig.batch_key`: two triggers that listed the same
+    detections in a different order want the same call.
+    """
+    if raw is None:
+        return ()
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list) or not raw:
+        raise ConfigError(
+            f"{where}.on_events must be a list of detections "
+            f"({', '.join(DETECTION_KEYS)}); leave it out to run on an interval"
+        )
+    keys: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
+            raise ConfigError(f"{where}.on_events entries must be detection names")
+        key = classify(item)
+        if key is None:
+            raise ConfigError(
+                f"{where}.on_events has {item!r}, which is not a detection "
+                f"this service tracks ({', '.join(DETECTION_KEYS)})"
+            )
+        keys.add(key)
+    return tuple(key for key in DETECTION_KEYS if key in keys)
+
+
+def _parse_cooldown(entry: Mapping[str, Any], where: str, on_events: Sequence[str]) -> float | None:
+    """``cooldown_minutes:``, or ``None`` to mean the trigger's interval.
+
+    Refused without ``on_events``, where it would do nothing at all: a trigger
+    on a clock is already paced by its interval. Setting one is a clear
+    statement about how often to look, and silently ignoring it is how someone
+    ends up believing a limit is in force that is not.
+    """
+    if entry.get("cooldown_minutes") is None:
+        return None
+    if not on_events:
+        raise ConfigError(
+            f"{where}.cooldown_minutes only means something with on_events; "
+            f"a trigger on a clock is paced by interval_minutes"
+        )
+    return _yaml_float(entry, "cooldown_minutes", 0.0, where, minimum=0.0)
 
 
 def _parse_trigger_cameras(raw: object, where: str) -> tuple[str, ...]:

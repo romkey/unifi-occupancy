@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from typing import Any
 
@@ -22,7 +24,7 @@ from unifi_occupancy.config import (
 from unifi_occupancy.discovery import discovery_messages, removal_messages
 from unifi_occupancy.info import service_info_payload
 from unifi_occupancy.metrics import Metrics
-from unifi_occupancy.models import Camera, parse_camera
+from unifi_occupancy.models import MOTION, PERSON, SIREN, Camera, parse_camera
 from unifi_occupancy.publisher import StatePublisher
 from unifi_occupancy.state import DetectionTracker
 from unifi_occupancy.triggers import (
@@ -719,6 +721,8 @@ def test_the_service_info_lists_the_triggers(config: Config) -> None:
             "key": "fire",
             "cameras": "all",
             "interval_minutes": 5.0,
+            "on_events": [],
+            "cooldown_minutes": None,
             "model": "some-vision-model",
             "publish_snapshot": False,
             "batch": True,
@@ -1758,3 +1762,555 @@ def test_recording_does_not_split_a_batch() -> None:
     pair = (FIRE, replace(FIRE, name="Smoke", record=False))
 
     assert [len(group) for group in group_triggers(pair)] == [2]
+
+
+# --------------------------------------------------------------------------- #
+# Running on demand
+# --------------------------------------------------------------------------- #
+
+#: The same question as FIRE, asked when something moves instead of on a clock.
+DEMAND = replace(FIRE, on_events=(MOTION,), cooldown_minutes=1.0)
+
+
+async def drain_demand(
+    watcher: TriggerWatcher, cameras: Sequence[Camera], until: Callable[[], bool]
+) -> None:
+    """Let the demand loop work through what is queued, then stop it.
+
+    Stepped by the event loop rather than timed out: a fake check waits on
+    nothing real, so this finishes as soon as the queued work has, and a slow
+    machine cannot turn it into a flake.
+    """
+    task = asyncio.create_task(watcher.run_on_demand(lambda: list(cameras)))
+    for _ in range(500):
+        if until():
+            break
+        await asyncio.sleep(0)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+def test_a_trigger_runs_on_an_interval_unless_it_says_otherwise() -> None:
+    assert FIRE.on_demand is False
+    assert FIRE.on_events == ()
+    assert DEMAND.on_demand is True
+
+
+def test_an_interval_trigger_ignores_a_detection() -> None:
+    """The two modes are exclusive: nothing can arrive at an interval trigger."""
+    watcher = watcher_for(FakeSnapshots(), FakeJudge(TriggerAnswer(MATCH)), FakeSink())
+
+    assert watcher.on_demand is False
+    assert watcher.demand(CAMERA, [MOTION]) is False
+    assert watcher.wants(CAMERA, [MOTION]) == ()
+
+
+async def test_the_first_detection_is_checked_and_the_burst_behind_it_is_not() -> None:
+    now = [100.0]
+    sink = FakeSink()
+    watcher = watcher_for(
+        FakeSnapshots(), FakeJudge(TriggerAnswer(MATCH)), sink, DEMAND, clock=lambda: now[0]
+    )
+
+    assert watcher.demand(CAMERA, [MOTION]) is True
+    await drain_demand(watcher, [CAMERA], lambda: bool(sink.published))
+
+    # A car going past is a dozen events in ninety seconds.
+    for _ in range(10):
+        now[0] += 3.0
+        assert watcher.demand(CAMERA, [MOTION]) is False
+    assert len(sink.published) == 1
+
+
+async def test_the_cooldown_lets_the_next_one_through() -> None:
+    now = [100.0]
+    sink = FakeSink()
+    watcher = watcher_for(
+        FakeSnapshots(), FakeJudge(TriggerAnswer(MATCH)), sink, DEMAND, clock=lambda: now[0]
+    )
+
+    assert watcher.demand(CAMERA, [MOTION]) is True
+    await drain_demand(watcher, [CAMERA], lambda: bool(sink.published))
+
+    now[0] += DEMAND.cooldown_seconds - 0.5
+    assert watcher.demand(CAMERA, [MOTION]) is False
+    now[0] += 1.0
+    assert watcher.demand(CAMERA, [MOTION]) is True
+
+
+def test_one_camera_s_cooldown_does_not_silence_another() -> None:
+    watcher = watcher_for(
+        FakeSnapshots(), FakeJudge(TriggerAnswer(MATCH)), FakeSink(), DEMAND, clock=lambda: 0.0
+    )
+
+    assert watcher.demand(CAMERA, [MOTION]) is True
+    assert watcher.demand(OTHER, [MOTION]) is True
+
+
+def test_any_of_the_listed_detections_is_enough() -> None:
+    """An or, not an and: whichever Protect reports first is the one that asks."""
+    both = replace(DEMAND, on_events=(MOTION, PERSON))
+    watcher = watcher_for(
+        FakeSnapshots(), FakeJudge(TriggerAnswer(MATCH)), FakeSink(), both, clock=lambda: 0.0
+    )
+
+    assert watcher.demand(CAMERA, [PERSON]) is True
+    assert watcher.wants(OTHER, [MOTION]) == (both,)
+    # Something it never asked to hear about.
+    assert watcher.demand(OTHER, [SIREN]) is False
+
+
+def test_a_detection_on_a_camera_the_trigger_does_not_watch_is_ignored() -> None:
+    watcher = watcher_for(
+        FakeSnapshots(),
+        FakeJudge(TriggerAnswer(MATCH)),
+        FakeSink(),
+        replace(DEMAND, cameras=("Front Door",)),
+        clock=lambda: 0.0,
+    )
+
+    assert watcher.demand(CAMERA, [MOTION]) is True
+    assert watcher.demand(OTHER, [MOTION]) is False
+
+
+def test_only_the_members_that_asked_to_hear_it_are_asked() -> None:
+    """A group agrees on the detections; it need not agree on the cameras."""
+    front = replace(DEMAND, name="Fire", cameras=("Front Door",))
+    everywhere = replace(DEMAND, name="Parcel")
+    watcher = watcher_for(
+        FakeSnapshots(),
+        FakeJudge(TriggerAnswer(MATCH)),
+        FakeSink(),
+        [front, everywhere],
+        clock=lambda: 0.0,
+    )
+
+    assert [trigger.key for trigger in watcher.wants(CAMERA, [MOTION])] == ["fire", "parcel"]
+    assert [trigger.key for trigger in watcher.wants(OTHER, [MOTION])] == ["parcel"]
+
+
+async def test_a_demanded_check_is_asked_published_and_recorded() -> None:
+    sink = FakeSink()
+    recorder = FakeRecorder()
+    judge = FakeJudge(TriggerAnswer(MATCH))
+    watcher = watcher_for(
+        FakeSnapshots(), judge, sink, DEMAND, clock=lambda: 0.0, recorder=recorder
+    )
+
+    assert watcher.demand(CAMERA, [MOTION]) is True
+    await drain_demand(watcher, [CAMERA, OTHER], lambda: bool(sink.published))
+
+    # The camera that moved, and only that camera.
+    assert [name for name, _ in sink.published] == ["Front Door"]
+    assert judge.images == [IMAGE]
+    assert recorder.recorded == [("Front Door", "fire", MATCH)]
+
+
+async def test_nothing_is_asked_until_something_happens() -> None:
+    """A trigger in this mode has no state at all until its first detection."""
+    sink = FakeSink()
+    judge = FakeJudge(TriggerAnswer(MATCH))
+    watcher = watcher_for(FakeSnapshots(), judge, sink, DEMAND, clock=lambda: 0.0)
+
+    await drain_demand(watcher, [CAMERA, OTHER], lambda: False)
+
+    assert sink.published == []
+    assert judge.images == []
+
+
+async def test_a_camera_that_goes_away_before_its_check_is_dropped() -> None:
+    sink = FakeSink()
+    judge = FakeJudge(TriggerAnswer(MATCH))
+    watcher = watcher_for(FakeSnapshots(), judge, sink, DEMAND, clock=lambda: 0.0)
+
+    assert watcher.demand(CAMERA, [MOTION]) is True
+    # The poll that ran in between found it gone.
+    await drain_demand(watcher, [OTHER], lambda: False)
+
+    assert sink.published == []
+    assert judge.images == []
+
+
+async def test_a_camera_coming_back_does_not_inherit_its_old_cooldown() -> None:
+    sink = FakeSink()
+    watcher = watcher_for(
+        FakeSnapshots(), FakeJudge(TriggerAnswer(MATCH)), sink, DEMAND, clock=lambda: 0.0
+    )
+
+    assert watcher.demand(CAMERA, [MOTION]) is True
+    await drain_demand(watcher, [CAMERA], lambda: bool(sink.published))
+    assert watcher.demand(CAMERA, [MOTION]) is False
+
+    watcher.forget([CAMERA.id])
+
+    assert watcher.demand(CAMERA, [MOTION]) is True
+
+
+async def test_the_detections_that_cost_nothing_are_counted() -> None:
+    metrics = Metrics()
+    sink = FakeSink()
+    watcher = watcher_for(
+        FakeSnapshots(),
+        FakeJudge(TriggerAnswer(MATCH)),
+        sink,
+        DEMAND,
+        clock=lambda: 0.0,
+        metrics=metrics,
+    )
+
+    watcher.demand(CAMERA, [MOTION])
+    await drain_demand(watcher, [CAMERA], lambda: bool(sink.published))
+    watcher.demand(CAMERA, [MOTION])
+    watcher.demand(CAMERA, [MOTION])
+
+    rendered = metrics.render()
+    assert 'trigger_demands_total{trigger="fire",outcome="admitted"} 1' in rendered
+    assert 'trigger_demands_total{trigger="fire",outcome="throttled"} 2' in rendered
+
+
+async def test_a_demanded_check_is_timed_like_a_sweep() -> None:
+    """The job series are per trigger in both modes, so a graph keeps working."""
+    metrics = Metrics()
+    sink = FakeSink()
+    watcher = watcher_for(
+        FakeSnapshots(),
+        FakeJudge(TriggerAnswer(MATCH)),
+        sink,
+        DEMAND,
+        clock=lambda: 0.0,
+        metrics=metrics,
+    )
+
+    watcher.demand(CAMERA, [MOTION])
+    await drain_demand(watcher, [CAMERA], lambda: bool(sink.published))
+
+    rendered = metrics.render()
+    assert 'job_runs_total{job="trigger:fire",outcome="success"} 1' in rendered
+    assert 'job_in_progress{job="trigger:fire"} 0' in rendered
+
+
+# --------------------------------------------------------------------------- #
+# Configuring demand
+# --------------------------------------------------------------------------- #
+
+DEMAND_YAML = """
+triggers:
+  - name: Fire
+    prompt: Is anything burning?
+    on_events:
+      - motion
+      - people
+    cooldown_minutes: 2
+"""
+
+
+def test_the_detections_a_trigger_listens_for_are_parsed() -> None:
+    (trigger,) = parse_file_config(DEMAND_YAML).triggers
+
+    assert trigger.on_demand is True
+    # Protect's own aliases are read the way the event stream's are, and the
+    # order is ours rather than the file's.
+    assert trigger.on_events == (MOTION, PERSON)
+    assert trigger.cooldown_minutes == 2.0
+    assert trigger.cooldown_seconds == 120.0
+
+
+def test_the_same_detections_in_a_different_order_are_the_same_trigger() -> None:
+    def events(listed: str) -> tuple[str, ...]:
+        (trigger,) = parse_file_config(f"""
+            triggers:
+              - name: Fire
+                prompt: Is anything burning?
+                on_events: {listed}
+            """).triggers
+        return trigger.on_events
+
+    assert events("[person, motion]") == events("[motion, person]") == (MOTION, PERSON)
+    assert events("[motion, motion]") == (MOTION,)
+
+
+def test_one_detection_need_not_be_written_as_a_list() -> None:
+    (trigger,) = parse_file_config("""
+        triggers:
+          - name: Fire
+            prompt: Is anything burning?
+            on_events: motion
+        """).triggers
+
+    assert trigger.on_events == (MOTION,)
+
+
+def test_the_cooldown_defaults_to_the_interval_it_replaces() -> None:
+    (trigger,) = parse_file_config("""
+        triggers:
+          - name: Fire
+            prompt: Is anything burning?
+            interval_minutes: 7
+            on_events: motion
+        """).triggers
+
+    assert trigger.cooldown_minutes is None
+    assert trigger.cooldown_seconds == 7 * 60.0
+
+
+@pytest.mark.parametrize(
+    ("body", "message"),
+    [
+        ("on_events: [dancing]", "not a detection"),
+        ("on_events: []", "leave it out"),
+        ("on_events: [1]", "must be detection names"),
+        ("on_events: motion\n                cooldown_minutes: -1", "at least 0"),
+        ("on_events: motion\n                cooldown_minutes: soon", "must be a number"),
+    ],
+)
+def test_a_broken_demand_setting_is_reported_rather_than_ignored(body: str, message: str) -> None:
+    with pytest.raises(ConfigError, match=message):
+        parse_file_config(f"""
+            triggers:
+              - name: Fire
+                prompt: Is anything burning?
+                {body}
+            """)
+
+
+def test_a_cooldown_without_anything_to_cool_down_is_refused() -> None:
+    """It would do nothing, and someone would believe a limit was in force."""
+    with pytest.raises(ConfigError, match="only means something with on_events"):
+        parse_file_config("""
+            triggers:
+              - name: Fire
+                prompt: Is anything burning?
+                cooldown_minutes: 2
+            """)
+
+
+def test_triggers_listening_for_different_things_do_not_share_a_call() -> None:
+    """A shared call is a shared schedule, and in this mode that is the events."""
+    motion = replace(DEMAND, name="Fire")
+    person = replace(DEMAND, name="Parcel", on_events=(PERSON,))
+    slower = replace(DEMAND, name="Gate", cooldown_minutes=5.0)
+
+    assert group_triggers([motion, person, slower]) == ((motion,), (person,), (slower,))
+    assert group_triggers([motion, replace(motion, name="Smoke")]) == (
+        (motion, replace(motion, name="Smoke")),
+    )
+
+
+def test_an_interval_trigger_never_shares_a_call_with_a_demand_one() -> None:
+    assert group_triggers([FIRE, DEMAND]) == ((FIRE,), (DEMAND,))
+
+
+def test_a_row_left_open_is_cut_at_whichever_ruler_paces_the_trigger() -> None:
+    assert FIRE.history_hold_seconds == FIRE.interval_seconds
+    assert DEMAND.history_hold_seconds == DEMAND.cooldown_seconds
+    # No cooldown written down: the interval is still what paces it.
+    assert replace(DEMAND, cooldown_minutes=None).history_hold_seconds == FIRE.interval_seconds
+
+
+def test_the_service_info_says_what_a_trigger_is_waiting_for(config: Config) -> None:
+    payload = service_info_payload(triggered_config(config, DEMAND, replace(FIRE, name="Gate")))
+
+    assert payload["features"]["demand_triggers"] is True
+    waiting = [
+        (entry["key"], entry["on_events"], entry["cooldown_minutes"])
+        for entry in payload["triggers"]
+    ]
+    assert waiting == [("fire", [MOTION], 1.0), ("gate", [], None)]
+
+
+def test_the_service_info_says_nothing_about_demand_when_nothing_uses_it(config: Config) -> None:
+    payload = service_info_payload(triggered_config(config, FIRE))
+
+    assert payload["features"]["demand_triggers"] is False
+    assert payload["triggers"][0]["on_events"] == []
+
+
+class Broken(Exception):
+    """Something structural failed, not a model or a snapshot."""
+
+
+class BrokenSink(FakeSink):
+    def __init__(self, error: BaseException) -> None:
+        super().__init__()
+        self.error = error
+
+    async def publish_trigger(
+        self, camera: Camera, result: TriggerResult, snapshot: bytes | None = None
+    ) -> None:
+        raise self.error
+
+
+@pytest.mark.parametrize("mode", ["interval", "demand"])
+async def test_a_check_that_fails_outright_marks_the_job_failed(mode: str) -> None:
+    """A model failure is an answer; a broken sink is not, and must be visible."""
+    metrics = Metrics()
+    trigger = DEMAND if mode == "demand" else FIRE
+    watcher = watcher_for(
+        FakeSnapshots(),
+        FakeJudge(TriggerAnswer(MATCH)),
+        BrokenSink(Broken("no broker")),
+        trigger,
+        clock=lambda: 0.0,
+        metrics=metrics,
+    )
+
+    if mode == "demand":
+        watcher.demand(CAMERA, [MOTION])
+        with pytest.raises(Broken):
+            await watcher.run_on_demand(lambda: [CAMERA])
+    else:
+        with pytest.raises(Broken):
+            await watcher.run_forever(lambda: [CAMERA])
+
+    rendered = metrics.render()
+    assert 'job_runs_total{job="trigger:fire",outcome="error"} 1' in rendered
+    assert 'job_in_progress{job="trigger:fire"} 0' in rendered
+
+
+async def test_being_cancelled_mid_check_leaves_no_job_running() -> None:
+    """Shutting down must not leave a gauge saying a check is still in flight."""
+    metrics = Metrics()
+    watcher = watcher_for(
+        FakeSnapshots(),
+        FakeJudge(TriggerAnswer(MATCH)),
+        BrokenSink(asyncio.CancelledError()),
+        DEMAND,
+        clock=lambda: 0.0,
+        metrics=metrics,
+    )
+
+    watcher.demand(CAMERA, [MOTION])
+    with pytest.raises(asyncio.CancelledError):
+        await watcher.run_on_demand(lambda: [CAMERA])
+
+    assert 'job_in_progress{job="trigger:fire"} 0' in metrics.render()
+
+
+async def test_a_camera_that_goes_away_during_its_own_check_is_not_published() -> None:
+    """A check takes minutes; the poll loop runs the whole time it is running."""
+    here = {CAMERA.id}
+
+    class LosingJudge(FakeJudge):
+        async def evaluate(self, image: bytes, **kwargs: Any) -> TriggerAnswer:
+            here.clear()
+            return await super().evaluate(image, **kwargs)
+
+    sink = FakeSink()
+    watcher = watcher_for(
+        FakeSnapshots(),
+        LosingJudge(TriggerAnswer(MATCH)),
+        sink,
+        is_current=lambda camera_id: camera_id in here,
+    )
+
+    await watcher.sweep([CAMERA])
+
+    assert sink.published == []
+
+
+def test_a_camera_already_waiting_is_not_queued_twice() -> None:
+    """A backlog must not turn into two checks of one camera in succession."""
+    now = [100.0]
+    sink = FakeSink()
+    watcher = watcher_for(
+        FakeSnapshots(), FakeJudge(TriggerAnswer(MATCH)), sink, DEMAND, clock=lambda: now[0]
+    )
+
+    assert watcher.demand(CAMERA, [MOTION]) is True
+    # Nothing has drained the queue, and the cooldown has long since passed.
+    now[0] += DEMAND.cooldown_seconds * 10
+    assert watcher.demand(CAMERA, [MOTION]) is False
+
+
+async def test_the_cooldown_runs_from_the_check_and_not_from_the_queueing() -> None:
+    """Admission and check can be minutes apart; the limit is on the calls."""
+    now = [100.0]
+    sink = FakeSink()
+    watcher = watcher_for(
+        FakeSnapshots(), FakeJudge(TriggerAnswer(MATCH)), sink, DEMAND, clock=lambda: now[0]
+    )
+
+    assert watcher.demand(CAMERA, [MOTION]) is True
+    # It sat behind other cameras for a while before anything looked at it.
+    now[0] += 300.0
+    await drain_demand(watcher, [CAMERA], lambda: bool(sink.published))
+    assert len(sink.published) == 1
+
+    # Long after it was admitted, but moments after it was actually checked.
+    now[0] += DEMAND.cooldown_seconds - 1.0
+    assert watcher.demand(CAMERA, [MOTION]) is False
+    now[0] += 2.0
+    assert watcher.demand(CAMERA, [MOTION]) is True
+
+
+async def test_a_camera_checked_and_cleared_can_be_demanded_again() -> None:
+    now = [0.0]
+    sink = FakeSink()
+    watcher = watcher_for(
+        FakeSnapshots(), FakeJudge(TriggerAnswer(MATCH)), sink, DEMAND, clock=lambda: now[0]
+    )
+
+    assert watcher.demand(CAMERA, [MOTION]) is True
+    await drain_demand(watcher, [CAMERA], lambda: bool(sink.published))
+    now[0] += DEMAND.cooldown_seconds
+    assert watcher.demand(CAMERA, [MOTION]) is True
+    await drain_demand(watcher, [CAMERA], lambda: len(sink.published) == 2)
+
+    assert len(sink.published) == 2
+
+
+def test_a_backlog_is_counted_apart_from_a_cooldown() -> None:
+    """Two reasons to decline, and only one of them means the endpoint is behind."""
+    metrics = Metrics()
+    watcher = watcher_for(
+        FakeSnapshots(),
+        FakeJudge(TriggerAnswer(MATCH)),
+        FakeSink(),
+        DEMAND,
+        clock=lambda: 0.0,
+        metrics=metrics,
+    )
+
+    watcher.demand(CAMERA, [MOTION])
+    watcher.demand(CAMERA, [MOTION])
+
+    rendered = metrics.render()
+    assert 'trigger_demands_total{trigger="fire",outcome="admitted"} 1' in rendered
+    assert 'trigger_demands_total{trigger="fire",outcome="pending"} 1' in rendered
+    # Nothing was inside a cooldown: it had not been looked at yet at all.
+    assert 'outcome="throttled"' not in rendered
+
+
+async def test_a_camera_that_flaps_does_not_get_two_checks_in_a_row() -> None:
+    """Forgetting it cannot unqueue it, so it is still waiting for that check."""
+    sink = FakeSink()
+    watcher = watcher_for(
+        FakeSnapshots(), FakeJudge(TriggerAnswer(MATCH)), sink, DEMAND, clock=lambda: 0.0
+    )
+
+    assert watcher.demand(CAMERA, [MOTION]) is True
+    # The poll found it gone, and the one after that found it back.
+    watcher.forget([CAMERA.id])
+    assert watcher.demand(CAMERA, [MOTION]) is False
+
+    await drain_demand(watcher, [CAMERA], lambda: bool(sink.published))
+
+    assert len(sink.published) == 1
+
+
+async def test_a_queued_camera_that_never_comes_back_stops_blocking_its_id() -> None:
+    """Its entry is dropped where it is reached, so the id is usable again."""
+    sink = FakeSink()
+    watcher = watcher_for(
+        FakeSnapshots(), FakeJudge(TriggerAnswer(MATCH)), sink, DEMAND, clock=lambda: 0.0
+    )
+
+    assert watcher.demand(CAMERA, [MOTION]) is True
+    watcher.forget([CAMERA.id])
+    # Reached while the camera is still absent: nothing is checked.
+    await drain_demand(watcher, [OTHER], lambda: False)
+    assert sink.published == []
+
+    # Back under the same id, and nothing left over says it is still waiting.
+    assert watcher.demand(CAMERA, [MOTION]) is True
