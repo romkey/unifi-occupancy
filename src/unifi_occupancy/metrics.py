@@ -96,6 +96,9 @@ OUTCOME_AUTH_ERROR: Final = "auth_error"
 DEMAND_ADMITTED: Final = "admitted"
 #: A detection dropped because that camera had been checked too recently.
 DEMAND_THROTTLED: Final = "throttled"
+#: A detection dropped because that camera is already waiting to be checked.
+#: Rising means the vision endpoint is not keeping up with the detections.
+DEMAND_PENDING: Final = "pending"
 
 
 def _escape_help(text: str) -> str:
@@ -620,8 +623,8 @@ class Metrics:
         self.trigger_demands = registry.counter(
             "trigger_demands_total",
             "Detections offered to a trigger running on demand, by trigger and "
-            "outcome. `throttled` arrived inside the camera's cooldown and did "
-            "not cost a vision call.",
+            "outcome. `throttled` arrived inside the camera's cooldown and "
+            "`pending` while it was already queued; neither cost a vision call.",
             ("trigger", "outcome"),
         )
         self.trigger_snapshots = registry.counter(
@@ -748,7 +751,7 @@ class Metrics:
                 self.configured_seconds.set(
                     trigger.cooldown_seconds, setting=f"trigger_{trigger.key}_cooldown"
                 )
-                for outcome in (DEMAND_ADMITTED, DEMAND_THROTTLED):
+                for outcome in (DEMAND_ADMITTED, DEMAND_THROTTLED, DEMAND_PENDING):
                     self.trigger_demands.prime(trigger=trigger.key, outcome=outcome)
             if trigger.record:
                 # So a trigger that is being written to the history reads as

@@ -54,6 +54,7 @@ import httpx
 from .config import TriggerConfig
 from .metrics import (
     DEMAND_ADMITTED,
+    DEMAND_PENDING,
     DEMAND_THROTTLED,
     OUTCOME_ERROR,
     OUTCOME_SUCCESS,
@@ -583,12 +584,15 @@ class TriggerWatcher:
         self._metrics = metrics or default_metrics()
         #: Cameras waiting for a demand check, oldest first.
         #:
-        #: Unbounded, and it does not need a bound: nothing reaches it that
-        #: the cooldown did not admit, so the most it can ever hold is one
-        #: entry per camera.
+        #: Unbounded, and it does not need a bound: a camera already on it is
+        #: never put on it again, so the most it can hold is one entry per
+        #: camera. :attr:`_pending` is what makes that true.
         self._demand: asyncio.Queue[str] = asyncio.Queue()
-        #: camera id -> clock reading when its last demand check was admitted.
-        self._admitted: dict[str, float] = {}
+        #: The ids currently on that queue.
+        self._pending: set[str] = set()
+        #: camera id -> clock reading when this camera was last looked at:
+        #: admitted, and then again when its check actually started.
+        self._looked: dict[str, float] = {}
 
     @property
     def config(self) -> TriggerConfig:
@@ -652,20 +656,27 @@ class TriggerWatcher:
         :meth:`run_on_demand`, where taking a minute does not hold up the next
         event.
 
-        ``True`` when a check was admitted. The cooldown is stamped here
-        rather than when the check finishes, so the limit is on how often a
-        camera is *looked at* and does not quietly stretch with the model's
-        latency.
+        ``True`` when a check was admitted. Two things can decline one. A
+        camera already on the queue is not put on it twice, however long it
+        has been waiting: it is going to be looked at, and the answer will be
+        about the frame as it is then rather than as it was when the detection
+        arrived. And a camera looked at too recently waits -- where "looked
+        at" means admitted *or* checked, whichever came last, because the two
+        can be minutes apart when the endpoint is slow and the limit the
+        cooldown is for is on the vision calls, not on the queueing.
         """
         asking = self.wants(camera, keys)
         if not asking:
             return False
+        if camera.id in self._pending:
+            self._declined(asking, DEMAND_PENDING)
+            logger.debug("%s is already waiting for its %s check", camera.name, self.job)
+            return False
         now = self._clock()
-        last = self._admitted.get(camera.id)
+        last = self._looked.get(camera.id)
         cooldown = self._config.cooldown_seconds
         if last is not None and now - last < cooldown:
-            for trigger in asking:
-                self._metrics.record_trigger_demand(trigger.key, DEMAND_THROTTLED)
+            self._declined(asking, DEMAND_THROTTLED)
             logger.debug(
                 "%s on %s is inside its %gs cooldown; not checking",
                 self.job,
@@ -673,11 +684,16 @@ class TriggerWatcher:
                 cooldown,
             )
             return False
-        self._admitted[camera.id] = now
+        self._looked[camera.id] = now
         for trigger in asking:
             self._metrics.record_trigger_demand(trigger.key, DEMAND_ADMITTED)
+        self._pending.add(camera.id)
         self._demand.put_nowait(camera.id)
         return True
+
+    def _declined(self, asking: Sequence[TriggerConfig], outcome: str) -> None:
+        for trigger in asking:
+            self._metrics.record_trigger_demand(trigger.key, outcome)
 
     def forget(self, camera_ids: Iterable[str]) -> None:
         """Drop the cooldown state of cameras that have gone away.
@@ -686,7 +702,12 @@ class TriggerWatcher:
         should not inherit a cooldown from before it left.
         """
         for camera_id in camera_ids:
-            self._admitted.pop(camera_id, None)
+            self._looked.pop(camera_id, None)
+            # Not taken off the queue -- nothing can reach into the middle of
+            # one -- but taken out of the way of a camera coming back. The
+            # entry itself is dropped when it is reached and nothing answers
+            # to that id.
+            self._pending.discard(camera_id)
 
     def selects(self, camera: Camera) -> bool:
         return any(self.triggers_for(camera))
@@ -906,11 +927,19 @@ class TriggerWatcher:
         """
         while True:
             camera_id = await self._demand.get()
+            self._pending.discard(camera_id)
             camera = next((item for item in cameras() if item.id == camera_id), None)
             if camera is None:
                 logger.debug("%s was asked about %s, which has gone", self.job, camera_id)
                 continue
-            await self._timed(self.visit(camera), self._clock())
+            started = self._clock()
+            # The cooldown runs from here, not from when this was admitted. A
+            # check that waited out a backlog has only just looked, and the
+            # next detection should wait a cooldown from *that* -- otherwise
+            # two checks of one camera run back to back, which is the overhead
+            # this mode exists to avoid.
+            self._looked[camera_id] = started
+            await self._timed(self.visit(camera), started)
 
     async def _timed(self, work: Awaitable[object], started: float) -> float:
         """Run one unit of work with the job gauges around it, and time it.

@@ -1806,26 +1806,33 @@ def test_an_interval_trigger_ignores_a_detection() -> None:
     assert watcher.wants(CAMERA, [MOTION]) == ()
 
 
-def test_the_first_detection_is_checked_and_the_burst_behind_it_is_not() -> None:
+async def test_the_first_detection_is_checked_and_the_burst_behind_it_is_not() -> None:
     now = [100.0]
+    sink = FakeSink()
     watcher = watcher_for(
-        FakeSnapshots(), FakeJudge(TriggerAnswer(MATCH)), FakeSink(), DEMAND, clock=lambda: now[0]
+        FakeSnapshots(), FakeJudge(TriggerAnswer(MATCH)), sink, DEMAND, clock=lambda: now[0]
     )
 
     assert watcher.demand(CAMERA, [MOTION]) is True
+    await drain_demand(watcher, [CAMERA], lambda: bool(sink.published))
+
     # A car going past is a dozen events in ninety seconds.
     for _ in range(10):
         now[0] += 3.0
         assert watcher.demand(CAMERA, [MOTION]) is False
+    assert len(sink.published) == 1
 
 
-def test_the_cooldown_lets_the_next_one_through() -> None:
+async def test_the_cooldown_lets_the_next_one_through() -> None:
     now = [100.0]
+    sink = FakeSink()
     watcher = watcher_for(
-        FakeSnapshots(), FakeJudge(TriggerAnswer(MATCH)), FakeSink(), DEMAND, clock=lambda: now[0]
+        FakeSnapshots(), FakeJudge(TriggerAnswer(MATCH)), sink, DEMAND, clock=lambda: now[0]
     )
 
     assert watcher.demand(CAMERA, [MOTION]) is True
+    await drain_demand(watcher, [CAMERA], lambda: bool(sink.published))
+
     now[0] += DEMAND.cooldown_seconds - 0.5
     assert watcher.demand(CAMERA, [MOTION]) is False
     now[0] += 1.0
@@ -1925,29 +1932,35 @@ async def test_a_camera_that_goes_away_before_its_check_is_dropped() -> None:
     assert judge.images == []
 
 
-def test_a_camera_coming_back_does_not_inherit_its_old_cooldown() -> None:
+async def test_a_camera_coming_back_does_not_inherit_its_old_cooldown() -> None:
+    sink = FakeSink()
     watcher = watcher_for(
-        FakeSnapshots(), FakeJudge(TriggerAnswer(MATCH)), FakeSink(), DEMAND, clock=lambda: 0.0
+        FakeSnapshots(), FakeJudge(TriggerAnswer(MATCH)), sink, DEMAND, clock=lambda: 0.0
     )
 
     assert watcher.demand(CAMERA, [MOTION]) is True
+    await drain_demand(watcher, [CAMERA], lambda: bool(sink.published))
     assert watcher.demand(CAMERA, [MOTION]) is False
+
     watcher.forget([CAMERA.id])
+
     assert watcher.demand(CAMERA, [MOTION]) is True
 
 
-def test_the_detections_that_cost_nothing_are_counted() -> None:
+async def test_the_detections_that_cost_nothing_are_counted() -> None:
     metrics = Metrics()
+    sink = FakeSink()
     watcher = watcher_for(
         FakeSnapshots(),
         FakeJudge(TriggerAnswer(MATCH)),
-        FakeSink(),
+        sink,
         DEMAND,
         clock=lambda: 0.0,
         metrics=metrics,
     )
 
     watcher.demand(CAMERA, [MOTION])
+    await drain_demand(watcher, [CAMERA], lambda: bool(sink.published))
     watcher.demand(CAMERA, [MOTION])
     watcher.demand(CAMERA, [MOTION])
 
@@ -2194,3 +2207,87 @@ async def test_a_camera_that_goes_away_during_its_own_check_is_not_published() -
     await watcher.sweep([CAMERA])
 
     assert sink.published == []
+
+
+def test_a_camera_already_waiting_is_not_queued_twice() -> None:
+    """A backlog must not turn into two checks of one camera in succession."""
+    now = [100.0]
+    sink = FakeSink()
+    watcher = watcher_for(
+        FakeSnapshots(), FakeJudge(TriggerAnswer(MATCH)), sink, DEMAND, clock=lambda: now[0]
+    )
+
+    assert watcher.demand(CAMERA, [MOTION]) is True
+    # Nothing has drained the queue, and the cooldown has long since passed.
+    now[0] += DEMAND.cooldown_seconds * 10
+    assert watcher.demand(CAMERA, [MOTION]) is False
+
+
+async def test_the_cooldown_runs_from_the_check_and_not_from_the_queueing() -> None:
+    """Admission and check can be minutes apart; the limit is on the calls."""
+    now = [100.0]
+    sink = FakeSink()
+    watcher = watcher_for(
+        FakeSnapshots(), FakeJudge(TriggerAnswer(MATCH)), sink, DEMAND, clock=lambda: now[0]
+    )
+
+    assert watcher.demand(CAMERA, [MOTION]) is True
+    # It sat behind other cameras for a while before anything looked at it.
+    now[0] += 300.0
+    await drain_demand(watcher, [CAMERA], lambda: bool(sink.published))
+    assert len(sink.published) == 1
+
+    # Long after it was admitted, but moments after it was actually checked.
+    now[0] += DEMAND.cooldown_seconds - 1.0
+    assert watcher.demand(CAMERA, [MOTION]) is False
+    now[0] += 2.0
+    assert watcher.demand(CAMERA, [MOTION]) is True
+
+
+async def test_a_camera_checked_and_cleared_can_be_demanded_again() -> None:
+    now = [0.0]
+    sink = FakeSink()
+    watcher = watcher_for(
+        FakeSnapshots(), FakeJudge(TriggerAnswer(MATCH)), sink, DEMAND, clock=lambda: now[0]
+    )
+
+    assert watcher.demand(CAMERA, [MOTION]) is True
+    await drain_demand(watcher, [CAMERA], lambda: bool(sink.published))
+    now[0] += DEMAND.cooldown_seconds
+    assert watcher.demand(CAMERA, [MOTION]) is True
+    await drain_demand(watcher, [CAMERA], lambda: len(sink.published) == 2)
+
+    assert len(sink.published) == 2
+
+
+def test_a_backlog_is_counted_apart_from_a_cooldown() -> None:
+    """Two reasons to decline, and only one of them means the endpoint is behind."""
+    metrics = Metrics()
+    watcher = watcher_for(
+        FakeSnapshots(),
+        FakeJudge(TriggerAnswer(MATCH)),
+        FakeSink(),
+        DEMAND,
+        clock=lambda: 0.0,
+        metrics=metrics,
+    )
+
+    watcher.demand(CAMERA, [MOTION])
+    watcher.demand(CAMERA, [MOTION])
+
+    rendered = metrics.render()
+    assert 'trigger_demands_total{trigger="fire",outcome="admitted"} 1' in rendered
+    assert 'trigger_demands_total{trigger="fire",outcome="pending"} 1' in rendered
+    # Nothing was inside a cooldown: it had not been looked at yet at all.
+    assert 'outcome="throttled"' not in rendered
+
+
+def test_forgetting_a_camera_clears_the_check_it_was_waiting_for() -> None:
+    watcher = watcher_for(
+        FakeSnapshots(), FakeJudge(TriggerAnswer(MATCH)), FakeSink(), DEMAND, clock=lambda: 0.0
+    )
+
+    assert watcher.demand(CAMERA, [MOTION]) is True
+    watcher.forget([CAMERA.id])
+
+    assert watcher.demand(CAMERA, [MOTION]) is True
