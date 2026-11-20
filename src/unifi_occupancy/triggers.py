@@ -698,16 +698,19 @@ class TriggerWatcher:
     def forget(self, camera_ids: Iterable[str]) -> None:
         """Drop the cooldown state of cameras that have gone away.
 
-        A camera id that comes back -- a camera renamed, or Protect restarted --
-        should not inherit a cooldown from before it left.
+        A camera id that comes back -- a camera renamed, or Protect restarted
+        -- should not inherit a cooldown from before it left.
+
+        What a camera cannot be forgiven is a check it is already waiting
+        for. Nothing can reach into the middle of a queue, so an entry filed
+        before it left is still there and still live: a camera that flaps
+        would otherwise be admitted a second time behind its own first entry
+        and checked twice in a row. The entry is dropped where it is reached,
+        in :meth:`run_on_demand`, which is the only place that can tell
+        whether the camera answers to that id by then.
         """
         for camera_id in camera_ids:
             self._looked.pop(camera_id, None)
-            # Not taken off the queue -- nothing can reach into the middle of
-            # one -- but taken out of the way of a camera coming back. The
-            # entry itself is dropped when it is reached and nothing answers
-            # to that id.
-            self._pending.discard(camera_id)
 
     def selects(self, camera: Camera) -> bool:
         return any(self.triggers_for(camera))

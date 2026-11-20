@@ -2282,12 +2282,35 @@ def test_a_backlog_is_counted_apart_from_a_cooldown() -> None:
     assert 'outcome="throttled"' not in rendered
 
 
-def test_forgetting_a_camera_clears_the_check_it_was_waiting_for() -> None:
+async def test_a_camera_that_flaps_does_not_get_two_checks_in_a_row() -> None:
+    """Forgetting it cannot unqueue it, so it is still waiting for that check."""
+    sink = FakeSink()
     watcher = watcher_for(
-        FakeSnapshots(), FakeJudge(TriggerAnswer(MATCH)), FakeSink(), DEMAND, clock=lambda: 0.0
+        FakeSnapshots(), FakeJudge(TriggerAnswer(MATCH)), sink, DEMAND, clock=lambda: 0.0
+    )
+
+    assert watcher.demand(CAMERA, [MOTION]) is True
+    # The poll found it gone, and the one after that found it back.
+    watcher.forget([CAMERA.id])
+    assert watcher.demand(CAMERA, [MOTION]) is False
+
+    await drain_demand(watcher, [CAMERA], lambda: bool(sink.published))
+
+    assert len(sink.published) == 1
+
+
+async def test_a_queued_camera_that_never_comes_back_stops_blocking_its_id() -> None:
+    """Its entry is dropped where it is reached, so the id is usable again."""
+    sink = FakeSink()
+    watcher = watcher_for(
+        FakeSnapshots(), FakeJudge(TriggerAnswer(MATCH)), sink, DEMAND, clock=lambda: 0.0
     )
 
     assert watcher.demand(CAMERA, [MOTION]) is True
     watcher.forget([CAMERA.id])
+    # Reached while the camera is still absent: nothing is checked.
+    await drain_demand(watcher, [OTHER], lambda: False)
+    assert sink.published == []
 
+    # Back under the same id, and nothing left over says it is still waiting.
     assert watcher.demand(CAMERA, [MOTION]) is True
