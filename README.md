@@ -264,6 +264,8 @@ Each trigger takes:
 | `prompt` | *required* | The question itself, in your own words |
 | `cameras` | `ALL` | A list of camera names, slugs or Protect ids — or `ALL` |
 | `interval_minutes` | `15` | How often each of those cameras is checked |
+| `on_events` | unset | Ask on these detections instead of on the interval — see below |
+| `cooldown_minutes` | `interval_minutes` | With `on_events`, the shortest gap between two checks of one camera |
 | `enabled` | `true` | `false` keeps the trigger written down but stops it running |
 | `model` | the health check's | Model to ask; must be able to see images |
 | `api_base_url` | the health check's | OpenAI-compatible endpoint for this trigger |
@@ -512,6 +514,63 @@ shared, which separate calls would not have survived either.
 `unifi-occupancy/info` lists `trigger_groups`, and
 `trigger_batch_calls_total{outcome}` counts batched calls and the fallbacks, so you can see
 what is actually being combined.
+
+### Asking only when something happens
+
+A trigger on a clock asks whether or not there is anything to see. A fire question on eight
+cameras every five minutes is 2,304 vision calls a day, and on a quiet night every one of
+them is a picture of an empty driveway.
+
+`on_events` replaces the clock with Protect's own detections:
+
+```yaml
+triggers:
+  - name: Fire
+    prompt: Is there an active fire in this frame?
+    cameras: ALL
+    on_events:
+      - motion
+      - person
+    cooldown_minutes: 2
+```
+
+The question is now put to a camera when Protect reports motion or a person starting on
+**that** camera, and at no other time. The list is an **or**: whichever arrives first is the
+one that asks, and nothing waits for the other. Any of the four detections can go in it —
+`motion`, `person`, `siren`, `smoke` — and Protect's own spellings work, so `people` and
+`person` mean the same thing.
+
+**The two modes are exclusive.** A trigger with `on_events` runs on detections and on
+nothing else; `interval_minutes` stops being a schedule and becomes only what
+`cooldown_minutes` falls back to. There is no mode that does both, because a trigger whose
+interval you could not read off its own configuration would be a trigger nobody could
+reason about.
+
+**`cooldown_minutes` is the point, not a detail.** Motion does not arrive as one event: a
+car going down the street is a dozen of them in ninety seconds, and one vision call each
+would be worse than the polling this replaces. The first detection in a quiet window is
+checked and the rest are dropped, **per camera** — so a burst at the front door costs one
+call and does not delay the gate. It defaults to `interval_minutes`, which is already the
+rate you were willing to ask at. Setting it on a trigger with no `on_events` is refused
+rather than ignored, since there would be nothing for it to pace.
+
+**What you give up.** Nothing that does not move is ever looked at. A gate that has been
+standing open all night is not noticed until something walks past it, and a trigger in this
+mode has no state at all — not `OFF`, nothing — until its first detection, which is the
+same honesty as `unknown`: it has not looked, so it does not say. The one case where this is
+the wrong trade is a question whose answer changes without anything moving in frame; those
+want the interval.
+
+This mode needs the Protect event stream, so it does nothing at all with
+`PROTECT_USE_WEBSOCKET=false`. The service says so loudly at startup rather than sitting
+there quietly asking nothing. Polling cannot stand in: it reports what is happening now,
+not that something just started.
+
+Grouping still applies, and the group is now the triggers that agree on the detections and
+the cooldown as well as on the endpoint and the model: two questions asked on motion at the
+front door are still one snapshot and one request. `trigger_demands_total{trigger,outcome}`
+counts what arrived and what the cooldown declined to pay for, which is the number worth
+watching for a week before you trust the setting.
 
 ### What it costs
 
@@ -799,6 +858,7 @@ prefixed `unifi_occupancy_`; the table leaves that off to stay readable.
 | `health_checks_total{camera,verdict}`, `health_check_duration_seconds`, `camera_health{camera,status}`, `health_last_check_timestamp_seconds{camera}` | The optional vision check: verdicts per camera, how long each took, when each was last looked at |
 | `trigger_checks_total{trigger,camera,answer}`, `trigger_check_duration_seconds{trigger}`, `trigger_state{trigger,camera,state}`, `trigger_last_check_timestamp_seconds{trigger,camera}` | Custom triggers: answers per trigger and camera, how long each check took, when each was last asked |
 | `trigger_batch_calls_total{outcome}` | Calls that asked several triggers at once. `unreadable` is one that fell back to separate calls |
+| `trigger_demands_total{trigger,outcome}` | Detections offered to a trigger running on `on_events`. `throttled` arrived inside the camera's cooldown and cost nothing |
 | `recorded_edges_total{kind,edge}` | Edges written to the history. A trigger's kind is `trigger:<name>` |
 | `trigger_snapshots_total{trigger,camera}` | Matching frames published to the broker. Stays absent unless a trigger has `publish_snapshot` on |
 | `recorded_edges_total{kind,edge}`, `recorder_failures_total{operation}`, `sheets_written_total` | The history database and the daily sheets |

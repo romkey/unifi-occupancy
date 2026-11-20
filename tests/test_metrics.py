@@ -488,3 +488,44 @@ def test_the_history_flag_is_off_without_the_sheets(config: Config, metrics: Met
     metrics.describe_config(replace(config, triggers=(TriggerConfig(name="Fire", prompt="?"),)))
 
     assert metrics.feature_enabled.value(feature="trigger_history") == 0
+
+
+def test_a_trigger_on_demand_publishes_the_cooldown_that_paces_it(
+    config: Config, metrics: Metrics
+) -> None:
+    metrics.describe_config(
+        replace(
+            config,
+            triggers=(
+                TriggerConfig(
+                    name="Fire or smoke",
+                    prompt="?",
+                    interval_minutes=15.0,
+                    on_events=("motion",),
+                    cooldown_minutes=2.0,
+                ),
+            ),
+        )
+    )
+    text = metrics.render()
+
+    assert samples(text, "unifi_occupancy_feature_enabled")['{feature="demand_triggers"}'] == 1
+    settings = samples(text, "unifi_occupancy_configured_seconds")
+    assert settings['{setting="trigger_fire_or_smoke_cooldown"}'] == 120
+    # The interval is still published: it is what the cooldown falls back to.
+    assert settings['{setting="trigger_fire_or_smoke_interval"}'] == 900
+    demands = samples(text, "unifi_occupancy_trigger_demands_total")
+    assert demands['{trigger="fire_or_smoke",outcome="admitted"}'] == 0
+    assert demands['{trigger="fire_or_smoke",outcome="throttled"}'] == 0
+
+
+def test_an_interval_trigger_publishes_no_cooldown(config: Config, metrics: Metrics) -> None:
+    metrics.describe_config(
+        replace(config, triggers=(TriggerConfig(name="Fire", prompt="?"),)),
+    )
+    text = metrics.render()
+
+    assert samples(text, "unifi_occupancy_feature_enabled")['{feature="demand_triggers"}'] == 0
+    assert '{setting="trigger_fire_cooldown"}' not in samples(
+        text, "unifi_occupancy_configured_seconds"
+    )

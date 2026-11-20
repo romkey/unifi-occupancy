@@ -92,6 +92,11 @@ OUTCOME_UNREADABLE: Final = "unreadable"
 OUTCOME_ERROR: Final = "error"
 OUTCOME_AUTH_ERROR: Final = "auth_error"
 
+#: A detection that led a trigger running on demand to look.
+DEMAND_ADMITTED: Final = "admitted"
+#: A detection dropped because that camera had been checked too recently.
+DEMAND_THROTTLED: Final = "throttled"
+
 
 def _escape_help(text: str) -> str:
     return text.replace("\\", "\\\\").replace("\n", "\\n")
@@ -612,6 +617,13 @@ class Metrics:
             "`unreadable` fell back to asking each trigger separately.",
             ("outcome",),
         )
+        self.trigger_demands = registry.counter(
+            "trigger_demands_total",
+            "Detections offered to a trigger running on demand, by trigger and "
+            "outcome. `throttled` arrived inside the camera's cooldown and did "
+            "not cost a vision call.",
+            ("trigger", "outcome"),
+        )
         self.trigger_snapshots = registry.counter(
             "trigger_snapshots_total",
             "Matching frames published, by trigger and camera. Only triggers "
@@ -700,6 +712,10 @@ class Metrics:
             ),
             feature="trigger_history",
         )
+        self.feature_enabled.set(
+            float(any(trigger.on_demand for trigger in config.active_triggers)),
+            feature="demand_triggers",
+        )
         self.feature_enabled.set(float(config.metrics.enabled), feature="metrics")
         self.configured_seconds.set(config.protect.poll_interval, setting="poll_interval")
         self.configured_seconds.set(config.detection_hold_seconds, setting="detection_hold")
@@ -725,6 +741,15 @@ class Metrics:
             self.configured_seconds.set(
                 trigger.interval_seconds, setting=f"trigger_{trigger.key}_interval"
             )
+            if trigger.on_demand:
+                # The interval above is still published, because it is still
+                # what the cooldown defaults to -- but what actually paces
+                # this trigger is the cooldown, so say so.
+                self.configured_seconds.set(
+                    trigger.cooldown_seconds, setting=f"trigger_{trigger.key}_cooldown"
+                )
+                for outcome in (DEMAND_ADMITTED, DEMAND_THROTTLED):
+                    self.trigger_demands.prime(trigger=trigger.key, outcome=outcome)
             if trigger.record:
                 # So a trigger that is being written to the history reads as
                 # zero edges before its first one, not as absent -- the same
@@ -926,6 +951,15 @@ class Metrics:
             self.trigger_state.set(
                 float(state == answer), trigger=trigger, camera=slug, state=state
             )
+
+    def record_trigger_demand(self, trigger: str, outcome: str) -> None:
+        """One detection offered to a trigger that runs on demand.
+
+        Not labelled by camera, unlike the checks: this counts how well the
+        cooldown is doing its job, and the answer wanted is "how many events
+        did we decline to pay for", which is a ratio per trigger.
+        """
+        self.trigger_demands.inc(trigger=trigger, outcome=outcome)
 
     def record_trigger_batch(self, outcome: str) -> None:
         """One call that asked several triggers at once."""
